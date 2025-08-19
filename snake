@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# Terminal Snake - simple interactive bash game
+# Controls: Arrow keys or WASD, P pause, Q quit, R restart on game over
+
+trap 'cleanup' EXIT INT TERM
+
+cleanup() {
+  # restore terminal
+  tput cnorm 2>/dev/null || true
+  tput sgr0 2>/dev/null || true
+  stty sane 2>/dev/null || true
+  clear
+}
+
+# put terminal into raw-ish mode and hide cursor
+tput civis 2>/dev/null || true
+stty -echo -icanon time 0 min 0
+
+# helper: draw border around play area
+draw_border() {
+  local top=$1 left=$2 h=$3 w=$4
+  for ((i=0;i<w+2;i++)); do
+    tput cup $top $((left+i)); printf '#'
+    tput cup $((top+h+1)) $((left+i)); printf '#'
+  done
+  for ((j=0;j<h+2;j++)); do
+    tput cup $((top+j)) $left; printf '#'
+    tput cup $((top+j)) $((left+w+1)); printf '#'
+  done
+}
+
+# place food at random free position
+place_food() {
+  while :; do
+    foodY=$((RANDOM % PLAY_H + TOP + 1))
+    foodX=$((RANDOM % PLAY_W + LEFT + 1))
+    local ok=1
+    for i in "${!snakeY[@]}"; do
+      if [ "${snakeY[$i]}" -eq "$foodY" ] && [ "${snakeX[$i]}" -eq "$foodX" ]; then ok=0; break; fi
+    done
+    if [ $ok -eq 1 ]; then
+      tput cup $foodY $foodX
+      tput setaf 1; printf '*'; tput sgr0
+      break
+    fi
+  done
+}
+
+# draw score/info line
+draw_info() {
+  tput cup 1 2
+  printf "Score: %3d  Length: %3d  Controls: Arrows/WASD  P:pause  Q:quit" "$score" "${#snakeY[@]}"
+}
+
+# main game loop (supports restart)
+while :; do
+  clear
+  LINES=$(tput lines)
+  COLS=$(tput cols)
+
+  TOP=3
+  LEFT=3
+  PLAY_H=$((LINES - 8))
+  PLAY_W=$((COLS - 6))
+
+  if [ $PLAY_H -lt 8 ] || [ $PLAY_W -lt 20 ]; then
+    tput cup 0 0
+    echo "Terminal too small. Resize to at least ~20x10 and run again."
+    cleanup
+    exit 1
+  fi
+
+  draw_border $TOP $LEFT $PLAY_H $PLAY_W
+
+  # initialize snake (head at index 0)
+  snakeY=()
+  snakeX=()
+  initial_len=5
+  centerY=$((TOP + PLAY_H / 2))
+  centerX=$((LEFT + PLAY_W / 2))
+  for ((i=0;i<initial_len;i++)); do
+    snakeY[$i]=$centerY
+    snakeX[$i]=$((centerX - i))
+    tput cup ${snakeY[$i]} ${snakeX[$i]}; printf 'o'
+  done
+  # head as big O
+  tput cup ${snakeY[0]} ${snakeX[0]}; printf 'O'
+
+  score=0
+  dx=1; dy=0   # initial direction: right
+  place_food
+  draw_info
+
+  game_over=0
+  paused=0
+
+  # game frame loop
+  while :; do
+    # dynamic speed: decreases a little as score grows
+    speed=$(awk -v s=$score 'BEGIN{v=0.12 - 0.002*s; if(v<0.03) v=0.03; printf("%.3f", v)}')
+
+    # read input with timeout = speed
+    key=
+    read -rsn1 -t "$speed" key 2>/dev/null
+    if [ "$key" = $'\e' ]; then
+      # read possible two more bytes for arrows
+      read -rsn2 -t 0.001 rest 2>/dev/null
+      key+=$rest
+    fi
+
+    # handle input
+    if [ -n "$key" ]; then
+      case "$key" in
+        $'\e[A'|w|W) new_dy=-1; new_dx=0 ;;  # up
+        $'\e[B'|s|S) new_dy=1; new_dx=0 ;;   # down
+        $'\e[C'|d|D) new_dy=0; new_dx=1 ;;   # right
+        $'\e[D'|a|A) new_dy=0; new_dx=-1 ;;  # left
+        p|P)
+          paused=1
+          tput cup $((TOP+PLAY_H+3)) $LEFT
+          tput setaf 3; printf "PAUSED - press P to resume, Q to quit"; tput sgr0
+          while :; do
+            read -rsn1 keyp
+            if [ "$keyp" = 'p' ] || [ "$keyp" = 'P' ]; then
+              paused=0
+              tput cup $((TOP+PLAY_H+3)) $LEFT
+              printf '%.s ' $(seq 1 $((COLS-LEFT-2)))  # clear the paused message line
+              break
+            elif [ "$keyp" = 'q' ] || [ "$keyp" = 'Q' ]; then
+              cleanup
+              exit 0
+            fi
+          done
+          ;;
+        q|Q)
+          game_over=1
+          break
+          ;;
+      esac
+
+      # change direction if not reversing
+      if [ -n "${new_dx+x}" ] || [ -n "${new_dy+x}" ]; then
+        # if reversing (new + current == 0) ignore
+        if (( new_dx + dx == 0 && new_dy + dy == 0 )); then
+          unset new_dx new_dy
+        else
+          dx=$new_dx; dy=$new_dy
+          unset new_dx new_dy
+        fi
+      fi
+    fi
+
+    # compute new head
+    headY=${snakeY[0]}
+    headX=${snakeX[0]}
+    newY=$((headY + dy))
+    newX=$((headX + dx))
+
+    # check wall collisions (inside area is TOP+1..TOP+PLAY_H, LEFT+1..LEFT+PLAY_W)
+    if [ $newY -lt $((TOP+1)) ] || [ $newY -gt $((TOP+PLAY_H)) ] || [ $newX -lt $((LEFT+1)) ] || [ $newX -gt $((LEFT+PLAY_W)) ]; then
+      game_over=1
+      break
+    fi
+
+    # check whether we're eating food
+    if [ "$newY" -eq "$foodY" ] && [ "$newX" -eq "$foodX" ]; then
+      ate=1
+    else
+      ate=0
+    fi
+
+    # check self-collision (note: moving into tail is allowed if tail will move away this frame)
+    tailIndex=$(( ${#snakeY[@]} - 1 ))
+    collided=0
+    for i in "${!snakeY[@]}"; do
+      if [ "${snakeY[$i]}" -eq "$newY" ] && [ "${snakeX[$i]}" -eq "$newX" ]; then
+        if [ $i -eq $tailIndex ] && [ $ate -eq 0 ]; then
+          # allowed - tail moves
+          :
+        else
+          collided=1
+          break
+        fi
+      fi
+    done
+    if [ $collided -eq 1 ]; then
+      game_over=1
+      break
+    fi
+
+    # move: draw old head as body
+    tput cup $headY $headX; printf 'o'
+
+    # insert new head
+    snakeY=("$newY" "${snakeY[@]}")
+    snakeX=("$newX" "${snakeX[@]}")
+
+    # draw new head
+    tput cup $newY $newX
+    tput setaf 2; printf 'O'; tput sgr0
+
+    if [ $ate -eq 1 ]; then
+      score=$((score+1))
+      place_food
+    else
+      # remove tail
+      lastIndex=$(( ${#snakeY[@]} - 1 ))
+      tailY=${snakeY[$lastIndex]}
+      tailX=${snakeX[$lastIndex]}
+      unset 'snakeY[lastIndex]'
+      unset 'snakeX[lastIndex]'
+      tput cup $tailY $tailX; printf ' '
+    fi
+
+    draw_info
+  done
+
+  # Game over handling
+  if [ $game_over -eq 1 ]; then
+    tput cup $((TOP + PLAY_H/2)) $((LEFT + PLAY_W/2 - 10))
+    tput setaf 1
+    printf "  GAME OVER  Score: %d  " "$score"
+    tput sgr0
+    tput cup $((TOP + PLAY_H/2 + 2)) $((LEFT + PLAY_W/2 - 14))
+    printf "Press R to restart, Q to quit"
+    # wait for R or Q
+    while :; do
+      read -rsn1 ans
+      if [ "$ans" = 'r' ] || [ "$ans" = 'R' ]; then
+        break  # outer while will restart
+      elif [ "$ans" = 'q' ] || [ "$ans" = 'Q' ]; then
+        cleanup
+        exit 0
+      fi
+    done
+  else
+    # quit cleanly (e.g., from pressing q during gameplay)
+    cleanup
+    exit 0
+  fi
+done
