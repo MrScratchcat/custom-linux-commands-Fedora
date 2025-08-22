@@ -1,0 +1,41 @@
+#!/bin/bash
+clear
+if command -v zenity &> /dev/null
+then
+  echo "zenity is installed" > /dev/null
+else
+  sudo pacman -Syyu --noconfirm
+  sudo pacman -S zenity --noconfirm
+  clear
+fi
+
+echo "select a folder to copy to ~/.minecraft/mods"
+sleep 1
+# Check if the ~/.minecraft directory exists, and create it if not
+minecraft_dir="$HOME/.minecraft"
+if [ ! -d "$minecraft_dir" ]; then
+  mkdir -p "$minecraft_dir"
+fi
+
+# Check if the ~/.minecraft/mods directory exists, and create it if not
+mods_dir="$minecraft_dir/mods"
+if [ ! -d "$mods_dir" ]; then
+  mkdir -p "$mods_dir"
+else
+  # If the mods directory already exists, delete its contents
+  rm -rf "$mods_dir"/*
+fi
+
+# Prompt the user to select a directory using zenity
+selected_folder=$(zenity --file-selection --directory --title="Select a folder")
+
+# Check if the user canceled folder selection
+if [ $? -ne 0 ]; then
+  zenity --error --text="No folder selected. Script terminated."
+  exit 1
+fi
+
+# Copy the contents of the selected folder to ~/.minecraft/mods
+cp -r "$selected_folder"/* "$mods_dir"
+
+zenity --info --text="Files copied to $mods_dir"

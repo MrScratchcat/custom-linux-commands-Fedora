@@ -1,0 +1,10 @@
+#!/bin/bash
+sudo dnf upgrade -y
+if [[ "$XDG_CURRENT_DESKTOP" == "GNOME" ]] || [[ "$DESKTOP_SESSION" == "gnome" ]]; then
+    gsettings set org.gnome.desktop.wm.preferences button-layout ":minimize,maximize,close"
+    sudo dnf install gnome-tweaks -y
+    sudo dnf install papirus-icon-theme -y
+    gsettings set org.gnome.desktop.interface icon-theme 'Papirus'
+else
+    echo "You are not using GNOME and you need gnome for this icon theme."
+fi
