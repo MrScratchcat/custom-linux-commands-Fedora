@@ -23,6 +23,7 @@ DEEPSEEK_DEFAULT_MODEL="deepseek-chat"  # Default DeepSeek model
 OLLAMA_BASE_URL="http://localhost:11434"  # Ollama server URL
 WEB_SEARCH_ENABLED=true                    # Enable web search by default (true/false)
 WEB_SEARCH_SITES=10                        # Number of search results to fetch (max 11)
+OLLAMA_KEEP_ALIVE="30m"                   # Keep Ollama model in memory after load
 
 # Initialize variables (using config values from above)
 BASE_URL="$OLLAMA_BASE_URL"
@@ -57,30 +58,102 @@ ANTHROPIC_VERSION="${ANTHROPIC_VERSION:-2023-06-01}"
 
 DEEPSEEK_MODELS_URL="${DEEPSEEK_MODELS_URL:-https://api.deepseek.com/v1/models}"
 
-if command -v ddgr &> /dev/null; then
-    echo "ddgr is already installed"
-else
-    echo "ddgr is not installed. Installing..."
-    sudo dnf install ddgr -y
-fi
-if command -v jq &> /dev/null; then
-    echo "jq is already installed"
-else
-    echo "jq is not installed. Installing..."
-    sudo dnf install jq -y
-fi
-if command -v curl &> /dev/null; then
-    echo "curl is already installed"
-else
-    echo "curl is not installed. Installing..."
-    sudo dnf install curl -y
-fi
-if command -v zenity &> /dev/null; then
-    echo "Zenity is already installed"
-else
-    echo "Zenity is not installed. Installing..."
-    sudo dnf install zenity -y
-fi
+# Check and install dependencies based on detected package manager
+check_and_install_deps() {
+    local deps=("ddgr" "jq" "curl" "zenity")
+    local missing_deps=()
+    
+    # Check which dependencies are missing
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            missing_deps+=("$dep")
+        else
+            echo "$dep is already installed"
+        fi
+    done
+    
+    # If no missing dependencies, return early
+    if [[ ${#missing_deps[@]} -eq 0 ]]; then
+        echo "All dependencies are already installed"
+        return 0
+    fi
+    
+    echo "Missing dependencies: ${missing_deps[*]}"
+    echo "Installing missing dependencies using $PACKAGE_MANAGER..."
+    
+    # Install based on detected package manager
+    case "$PACKAGE_MANAGER" in
+        "dnf")
+            sudo dnf install -y "${missing_deps[@]}"
+            ;;
+        "apt")
+            sudo apt update && sudo apt install -y "${missing_deps[@]}"
+            ;;
+        "pacman")
+            sudo pacman -S --noconfirm "${missing_deps[@]}"
+            ;;
+        "yum")
+            sudo yum install -y "${missing_deps[@]}"
+            ;;
+        "zypper")
+            sudo zypper install -y "${missing_deps[@]}"
+            ;;
+        "apk")
+            sudo apk add "${missing_deps[@]}"
+            ;;
+        "rpm-ostree/flatpak")
+            # For atomic desktops, try rpm-ostree first, then flatpak for GUI apps
+            echo "Detected atomic desktop, using rpm-ostree for system packages..."
+            for dep in "${missing_deps[@]}"; do
+                if [[ "$dep" == "zenity" ]]; then
+                    # Zenity might be available as flatpak
+                    echo "Installing $dep via rpm-ostree (will require reboot)..."
+                    sudo rpm-ostree install "$dep" || {
+                        echo "rpm-ostree failed for $dep, trying flatpak..."
+                        flatpak install -y flathub org.gnome.zenity 2>/dev/null || true
+                    }
+                else
+                    sudo rpm-ostree install "$dep"
+                fi
+            done
+            echo "Note: rpm-ostree changes require a reboot to take effect."
+            echo "Run 'systemctl reboot' when ready."
+            ;;
+        "unknown"|*)
+            echo "Unknown package manager. Please install these packages manually:"
+            echo "  ${missing_deps[*]}"
+            echo ""
+            echo "Common installation commands:"
+            echo "  Fedora/RHEL/CentOS: sudo dnf install -y ${missing_deps[*]}"
+            echo "  Ubuntu/Debian: sudo apt install -y ${missing_deps[*]}"
+            echo "  Arch/Manjaro: sudo pacman -S --noconfirm ${missing_deps[*]}"
+            echo "  openSUSE: sudo zypper install -y ${missing_deps[*]}"
+            echo "  Alpine: sudo apk add ${missing_deps[*]}"
+            return 1
+            ;;
+    esac
+    
+    # Verify installation
+    echo "Verifying installation..."
+    local still_missing=()
+    for dep in "${missing_deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            still_missing+=("$dep")
+        fi
+    done
+    
+    if [[ ${#still_missing[@]} -gt 0 ]]; then
+        echo "Warning: Some dependencies are still missing: ${still_missing[*]}"
+        echo "The script may not work correctly without these packages."
+        return 1
+    else
+        echo "All dependencies successfully installed!"
+        return 0
+    fi
+}
+
+# Run dependency check
+check_and_install_deps
 
 
 # Model selection function
@@ -164,6 +237,16 @@ select_model() {
         # Extract just the model name without the provider suffix
         echo "$selected_model" | sed 's/ ([^)]*)//'
     fi
+}
+
+# Preload an Ollama model into memory (warm start + keep alive)
+preload_ollama_model() {
+    local model="$1"
+    [[ -z "$model" ]] && return 0
+    # Warm the model with a tiny non-streaming request and keep it alive
+    local payload
+    payload=$(jq -n --arg model "$model" --arg ka "$OLLAMA_KEEP_ALIVE" '{model:$model, prompt:" ", stream:false, keep_alive:$ka}')
+    curl -s -X POST "${BASE_URL}/api/generate" -H "Content-Type: application/json" -d "$payload" >/dev/null 2>&1 || true
 }
 
 # Detect OS
@@ -949,6 +1032,7 @@ STRICT RULES:
             --arg model "$model" \
             --arg sys_msg "$system_message" \
             --argjson history "$history_messages" \
+            --arg ka "$OLLAMA_KEEP_ALIVE" \
             '{
                 model: $model,
                 messages: [
@@ -956,7 +1040,8 @@ STRICT RULES:
                     $history[]
                 ],
                 stream: false,
-                options: {temperature: 0.1}
+                options: {temperature: 0.1},
+                keep_alive: $ka
             }')
         raw=$(curl -s -X POST "${BASE_URL}/api/chat" \
             -H "Content-Type: application/json" \
@@ -1054,6 +1139,120 @@ STRICT RULES:
         return 1
     fi
 
+    add_history "assistant" "$ai_cmd"
+    echo "$ai_cmd"
+}
+
+# Ask AI with an attached image (Ollama vision-capable models only for now)
+ask_ai_with_image() {
+    local prompt_text="$1"
+    local model="$2"
+    local image_b64="$3"
+    local image_mime="$4"  # not used by Ollama, reserved for other providers
+
+    local raw_response_file=$(mktemp)
+    local ZENITY_PID=""
+
+    cleanup() {
+        if [[ -n "$ZENITY_PID" ]]; then
+            kill $ZENITY_PID 2>/dev/null || true
+            wait $ZENITY_PID 2>/dev/null || true
+        fi
+        [[ -f "$raw_response_file" ]] && rm -f "$raw_response_file"
+    }
+    trap cleanup EXIT
+
+    add_history "user" "[image uploaded] $prompt_text"
+
+    # System message same as text-only path
+    local system_message="You are a Linux terminal expert. Respond with ONE valid bash command between triple backticks.
+STRICT RULES:
+1. Command must work on $OS_NAME (version $OS_VERSION) which uses $PACKAGE_MANAGER package manager
+2. Use only installed core utilities
+3. Put command in \`\`\`bash block
+4. ALWAYS use the correct package manager for this system:
+   - For $OS_NAME: Use $PACKAGE_MANAGER (NOT apt, NOT dnf, NOT pacman unless it's the correct one)
+   - Use -y with apt, dnf, yum
+   - Use --noconfirm with pacman
+   - Use --force or -f when overwriting files
+   - Use yes | command or echo 'y' | command for other prompts
+5. NEVER suggest commands that will wait for user input
+6. Validate syntax before responding
+7. Consider the specific OS ($OS_NAME) and its package manager ($PACKAGE_MANAGER)
+8. Use your knowledge of $OS_NAME best practices and current command syntax
+9. CRITICAL: If this is Fedora/RedHat family, use 'dnf' not 'apt'
+10. CRITICAL: If this is Ubuntu/Debian family, use 'apt' not 'dnf'
+11. CRITICAL: If this is Arch family, use 'pacman' not 'apt' or 'dnf'
+12. CRITICAL: If this is fedora silverblue/bazzite/aurora/bluefin , use 'rpm-ostree/flatpak' not 'apt' or 'dnf'
+13. Never use sudo when installing a flatpak package,
+14. never forget to use -y/--noconfirm when installing packages
+15. For flatpak packages, use 'flatpak install --user' but on atomic desktops use like bazzite 'flatpak install --system' dont forget the -y at the end
+16. You dont always need to use flatpak on atomic desktops, you can use rpm-ostree to install packages"
+
+    local provider=$(detect_provider_for_model "$model")
+
+    if [[ "$provider" != "ollama" ]]; then
+        zenity --warning --text="Image upload is currently supported only for Ollama models." --width=420
+        return 1
+    fi
+
+    # Progress spinner
+    zenity --progress --title="Processing Image" --text="Analyzing image and generating command..." \
+        --pulsate --no-cancel --width=340 2>/dev/null &
+    ZENITY_PID=$!
+
+    # Build Ollama vision chat payload with image (Ollama expects images array on the message)
+    local payload
+    payload=$(jq -n \
+        --arg model "$model" \
+        --arg sys_msg "$system_message" \
+        --arg txt "$prompt_text" \
+        --arg img "$image_b64" \
+        --arg ka "$OLLAMA_KEEP_ALIVE" \
+        '{
+            model: $model,
+            messages: [
+                {role: "system", content: $sys_msg},
+                {role: "user", content: $txt, images: [$img]}
+            ],
+            stream: false,
+            options: {temperature: 0.1},
+            keep_alive: $ka
+        }')
+
+    local raw
+    raw=$(curl -s -X POST "${BASE_URL}/api/chat" -H "Content-Type: application/json" -d "$payload")
+    echo "$raw" > "$raw_response_file"
+
+    # Stop spinner
+    cleanup
+    trap - EXIT
+
+    # Extract response content then the command
+    local response_content
+    response_content=$(jq -r '.message.content' "$raw_response_file")
+    response_content=$(echo "$response_content" | sed 's/\\n/ /g; s/\\r/ /g; s/\\t/ /g; s/<think>.*<\/think>//g; s/<think>.*//g')
+    ai_cmd=$(extract_command "$response_content")
+
+    if [[ -z "$ai_cmd" || "$ai_cmd" =~ ^[[:space:]]*$ ]]; then
+        zenity --question \
+            --title="Command Extraction Failed" \
+            --text="The AI provided a response, but I couldn't extract a command.\n\nUse the raw response instead?" \
+            --ok-label="Use Anyway" --cancel-label="Retry" \
+            --extra-button="Quit" \
+            --width=520
+        local extraction_result=$?
+        case $extraction_result in
+            0)
+                ai_cmd=$(echo "$response_content" | tr -d '`' | sed 's/<[^>]*>//g' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') ;;
+            5)
+                return 2 ;;
+            *)
+                return 1 ;;
+        esac
+    fi
+
+    ai_cmd=$(echo "$ai_cmd" | sed -E 's/(^[[:space:]]*[\x60`]?|[\x60`]?[[:space:]]*$)//g' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d')
     add_history "assistant" "$ai_cmd"
     echo "$ai_cmd"
 }
@@ -1343,6 +1542,11 @@ initialize_history
 SELECTED_MODEL=$(select_model)
 [ -z "$SELECTED_MODEL" ] && exit 1
 
+# If selected model is an Ollama model, preload it into memory
+if [[ "$(detect_provider_for_model "$SELECTED_MODEL")" == "ollama" ]]; then
+    preload_ollama_model "$SELECTED_MODEL"
+fi
+
 # Password input with validation
 while true; do
     PASSWORD=$(zenity --password --title="Sudo Authentication" \
@@ -1377,7 +1581,7 @@ while true; do
     
     user_input=$(zenity --entry \
         --title="$title_text" \
-        --text="Enter task description:\n\nSpecial commands:\n• 'switch model' - Change AI model\n• 'clear history' - Clear chat history\n• 'toggle web search' - Enable/disable web search" \
+        --text="Enter task description:\n\nSpecial commands:\n• 'switch model' - Change AI model\n• 'clear history' - Clear chat history\n• 'toggle web search' - Enable/disable web search\n• 'show' - Upload an image to use as context (Ollama vision models)" \
         --width=600 --height=200)
     user_response_code=$?
     if [[ $user_response_code -ne 0 ]]; then
@@ -1389,6 +1593,10 @@ while true; do
         "switch model")
             NEW_MODEL=$(select_model)
             [ -n "$NEW_MODEL" ] && SELECTED_MODEL="$NEW_MODEL"
+            # Preload if Ollama
+            if [[ "$(detect_provider_for_model "$SELECTED_MODEL")" == "ollama" ]]; then
+                preload_ollama_model "$SELECTED_MODEL"
+            fi
             continue
             ;;
         "clear history")
@@ -1408,6 +1616,83 @@ while true; do
                 fi
             fi
             continue
+            ;;
+        "show")
+            # Let user pick an image and ask a prompt; supported for Ollama vision models
+            IMAGE_FILE=$(zenity --file-selection --title="Select an image" \
+                --file-filter="Images | *.png *.jpg *.jpeg *.webp *.gif *.bmp")
+            if [[ $? -ne 0 || -z "$IMAGE_FILE" ]]; then
+                continue
+            fi
+            if [[ ! -f "$IMAGE_FILE" ]]; then
+                zenity --error --text="Selected file not found." --width=300
+                continue
+            fi
+            # Determine MIME (optional for Ollama) and base64 encode
+            if command -v file >/dev/null 2>&1; then
+                IMAGE_MIME=$(file --brief --mime-type "$IMAGE_FILE" 2>/dev/null)
+            else
+                IMAGE_MIME="image/png"
+            fi
+            if command -v base64 >/dev/null 2>&1; then
+                IMAGE_B64=$(base64 -w 0 "$IMAGE_FILE" 2>/dev/null || base64 "$IMAGE_FILE" | tr -d '\n')
+            else
+                IMAGE_B64=$(openssl base64 -A -in "$IMAGE_FILE" 2>/dev/null)
+            fi
+            if [[ -z "$IMAGE_B64" ]]; then
+                zenity --error --text="Failed to encode image." --width=320
+                continue
+            fi
+            SHOW_PROMPT=$(zenity --entry --title="Describe your request" \
+                --text="What should I do with this image? (Context for the command)" \
+                --width=600 --height=150)
+            if [[ $? -ne 0 || -z "$SHOW_PROMPT" ]]; then
+                continue
+            fi
+            # Generate command using the image as context
+            ai_cmd=$(ask_ai_with_image "$SHOW_PROMPT" "$SELECTED_MODEL" "$IMAGE_B64" "$IMAGE_MIME")
+            ai_result=$?
+            case $ai_result in
+                0)
+                    display_cmd=$(sed 's/sudo /sudo -S /g' <<< "$ai_cmd")
+                    if [[ "$display_cmd" =~ ^sudo[[:space:]] ]]; then
+                        exec_cmd="echo '$PASSWORD' | $display_cmd"
+                    else
+                        exec_cmd="$display_cmd"
+                    fi
+                    sanitized_cmd=$(sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' <<< "$display_cmd")
+                    zenity_output=$(zenity --question \
+                        --title="Confirm Command" \
+                        --text="Model: $SELECTED_MODEL\n\nSuggested command:\n<tt>$sanitized_cmd</tt>\n\nExecute?" \
+                        --ok-label="Execute" --cancel-label="Cancel" --extra-button="Quit" \
+                        --width=400 2>&1)
+                    zenity_result=$?
+                    if [[ "$zenity_output" == *"Quit"* || $zenity_result -eq 5 ]]; then
+                        echo "Returning to main prompt after quit" >&2
+                        continue
+                    elif [ $zenity_result -ne 0 ]; then
+                        continue
+                    fi
+                    execute_with_check "$display_cmd" "$exec_cmd"
+                    exec_result=$?
+                    if [[ $exec_result -eq 0 ]]; then
+                        zenity --text-info --title="Command Output" --filename="$TMP_FILE" --width=800 --height=600 --ok-label="Continue" 2>/dev/null
+                        continue
+                    else
+                        # Reuse existing failure handling by showing output and letting user decide next
+                        zenity --text-info --title="Command Result" --filename="$TMP_FILE" --width=800 --height=600 --ok-label="Continue" 2>/dev/null
+                        continue
+                    fi
+                    ;;
+                1)
+                    # Retry or unsupported provider; already messaged
+                    continue ;;
+                2)
+                    # User chose quit in extraction dialog
+                    continue ;;
+                *)
+                    continue ;;
+            esac
             ;;
         *)
             run_until_success "$user_input" "$SELECTED_MODEL"
