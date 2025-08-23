@@ -1,0 +1,23 @@
+#!/bin/bash
+if command -v flatpak &> /dev/null
+then
+  echo "flatpak is installed" > /dev/null
+else
+  sudo pacman -Syyu --noconfirm
+  sudo pacman -S flatpak --noconfirm
+  clear
+fi
+flatpak install --user flathub one.flipperzero.qFlipper -y
+echo '#Flipper Zero serial port
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", ATTRS{manufacturer}=="Flipper Devices Inc.", TAG+="uaccess"
+#Flipper Zero DFU
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="df11", ATTRS{manufacturer}=="STMicroelectronics", TAG+="uaccess"
+#Flipper ESP32s2 BlackMagic
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="40??", ATTRS{manufacturer}=="Flipper Devices Inc.", TAG+="uaccess"
+' > 42-flipperzero.rules
+sudo cp 42-flipperzero.rules /etc/udev/rules.d/42-flipperzero.rules
+rm 42-flipperzero.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+sudo usermod -a -G uucp $USER
+echo "You may need to reboot."

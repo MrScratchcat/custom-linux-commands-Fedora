@@ -1,0 +1,6 @@
+#!/bin/bash
+git clone --recursive --jobs 8 https://github.com/Next-Flip/Momentum-Firmware.git
+cd Momentum-Firmware/
+./fbt flash_usb_full
+cd .. 
+rm -rf Momentum-Firmware
