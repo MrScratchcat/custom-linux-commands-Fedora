@@ -9,11 +9,11 @@ else
   clear
 fi
 if lspci | grep -i "vga" | grep -iq "intel"; then
-    sudo pacman -S vulkan-intel --noconfirm 
+    sudo dnf install -y vulkan-intel
 elif lspci | grep -i "vga\|3d" | grep -iq "nvidia"; then
-    sudo pacman -S vulkan-nouveau --noconfirm 
+    sudo dnf install -y vulkan-nouveau
 elif lspci | grep -i "vga\|display" | grep -iq "amd\|ati"; then
-    sudo pacman -S vulkan-radeon --noconfirm 
+    sudo dnf install -y vulkan-radeon
 fi
 sudo dnf copr enable ryanabx/cosmic-epoch -y
 sudo dnf install -y power-profiles-daemon cosmic-desktop
