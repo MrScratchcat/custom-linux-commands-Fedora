@@ -1,0 +1,32 @@
+#!/bin/bash
+sudo dnf upgrade -y 
+if command -v flatpak &> /dev/null
+then
+  echo "flatpak is installed" > /dev/null
+else
+  sudo sudo dnf install flatpak -y
+  flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+  clear
+fi
+if lspci | grep -i "vga" | grep -iq "intel"; then
+    sudo pacman -S vulkan-intel --noconfirm 
+elif lspci | grep -i "vga\|3d" | grep -iq "nvidia"; then
+    sudo pacman -S vulkan-nouveau --noconfirm 
+elif lspci | grep -i "vga\|display" | grep -iq "amd\|ati"; then
+    sudo pacman -S vulkan-radeon --noconfirm 
+fi
+sudo dnf copr enable ryanabx/cosmic-epoch -y
+sudo dnf install -y power-profiles-daemon cosmic-desktop
+flatpak install flathub dev.edfloreshz.CosmicTweaks -y
+if pgrep -x "lightdm" > /dev/null; then
+    sudo systemctl disable lightdm
+elif pgrep -x "gdm" > /dev/null; then
+    sudo systemctl disable gdm
+elif pgrep -x "sddm" > /dev/null; then
+    sudo systemctl disable sddm
+elif pgrep -x "xdm" > /dev/null; then
+    sudo systemctl disable xdm
+elif pgrep -x "lxdm" > /dev/null; then
+    sudo systemctl disable lxdm
+fi
+sudo systemctl enable cosmic-greeter
