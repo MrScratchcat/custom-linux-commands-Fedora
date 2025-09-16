@@ -1,0 +1,440 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# QEMU + Zenity VM Manager (looping UI)
+# - Create/start/manage VMs
+# - Sliders for vCPU, RAM, and primary disk size (create & grow), capped by system limits
+# - Storage add/attach/detach/grow
+# - VirGL 3D toggle
+# - QEMU auto-install (APT/DNF/Zypper/Pacman), no "installed!" popup
+#
+# VMs:  ~/VMs/<name>/{vm.conf,disk.qcow2,extra_disks.list,uefi_vars.fd}
+
+VM_HOME="${VM_HOME:-$HOME/VMs}"
+mkdir -p "$VM_HOME"
+
+# ---------- Utilities ----------
+sanitize_name(){ echo "$1" | tr ' ' '_' | sed -E 's/[^A-Za-z0-9._-]+/_/g'; }
+msg_info(){ zenity --info --no-wrap --text="$1" >/dev/null 2>&1 || true; }
+msg_err(){  zenity --error --no-wrap --text="$1" >/dev/null 2>&1 || true; }
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "$1 not found"; exit 1; }; }
+
+# Require Zenity for UI (don’t auto-install zenity itself)
+need zenity
+
+declare -A QEMU_BIN=(
+  [x86_64]=qemu-system-x86_64
+  [i386]=qemu-system-i386
+  [aarch64]=qemu-system-aarch64
+  [arm]=qemu-system-arm
+  [riscv64]=qemu-system-riscv64
+  [ppc64]=qemu-system-ppc64
+  [ppc]=qemu-system-ppc
+  [mips]=qemu-system-mips
+  [mipsel]=qemu-system-mipsel
+  [mips64]=qemu-system-mips64
+  [mips64el]=qemu-system-mips64el
+  [sparc]=qemu-system-sparc
+  [sparc64]=qemu-system-sparc64
+  [s390x]=qemu-system-s390x
+  [alpha]=qemu-system-alpha
+  [m68k]=qemu-system-m68k
+)
+
+# ---------- Auto-install QEMU if missing ----------
+detect_pkg_mgr(){
+  if command -v apt-get >/dev/null; then echo apt; return; fi
+  if command -v dnf >/dev/null; then echo dnf; return; fi
+  if command -v zypper >/dev/null; then echo zypper; return; fi
+  if command -v pacman >/dev/null; then echo pacman; return; fi
+  echo unknown
+}
+
+ensure_qemu_installed(){
+  local found=0
+  for a in "${!QEMU_BIN[@]}"; do command -v "${QEMU_BIN[$a]}" >/dev/null && { found=1; break; }; done
+  [[ $found -eq 1 ]] && return 0
+
+  if ! zenity --question --title="QEMU not found" --text="No QEMU system emulators detected.\nInstall QEMU now? (root required)"; then
+    msg_err "QEMU not installed. Exiting."; exit 1
+  fi
+
+  local mgr; mgr="$(detect_pkg_mgr)"
+  local sudo_cmd=""; [[ $EUID -ne 0 ]] && sudo_cmd="sudo"
+  case "$mgr" in
+    apt)    $sudo_cmd apt-get update -y >/dev/null 2>&1 || true
+            $sudo_cmd apt-get install -y qemu-system qemu-utils ovmf >/dev/null ;;
+    dnf)    $sudo_cmd dnf -y install @virtualization qemu-img edk2-ovmf edk2-aarch64 >/dev/null ;;
+    zypper) $sudo_cmd zypper -n refresh >/dev/null 2>&1 || true
+            $sudo_cmd zypper -n install qemu qemu-tools >/dev/null || true
+            $sudo_cmd zypper -n install qemu-ovmf-x86_64 >/dev/null 2>&1 || true
+            $sudo_cmd zypper -n install qemu-uefi-aarch64 >/dev/null 2>&1 || true ;;
+    pacman) $sudo_cmd pacman -Sy --noconfirm >/dev/null 2>&1 || true
+            $sudo_cmd pacman -S --needed --noconfirm qemu edk2-ovmf >/dev/null ;;
+    *)      msg_err "Unsupported package manager. Install QEMU manually."; exit 1 ;;
+  esac
+
+  for a in "${!QEMU_BIN[@]}"; do command -v "${QEMU_BIN[$a]}" >/dev/null && return 0; done
+  msg_err "QEMU install seems to have failed. Please install manually."; exit 1
+}
+
+ensure_qemu_installed
+need qemu-img
+
+# ---------- Build AVAILABLE arches ----------
+AVAILABLE=()
+for arch in "${!QEMU_BIN[@]}"; do command -v "${QEMU_BIN[$arch]}" >/dev/null && AVAILABLE+=("$arch"); done
+[[ ${#AVAILABLE[@]} -eq 0 ]] && { msg_err "No qemu-system-* binaries found."; exit 1; }
+
+# ---------- UEFI detection ----------
+detect_uefi(){
+  local arch="$1"
+  if [[ "$arch" =~ ^(x86_64|i386)$ ]]; then
+    [[ -f /usr/share/OVMF/OVMF_CODE.fd && -f /usr/share/OVMF/OVMF_VARS.fd ]] && { echo "/usr/share/OVMF/OVMF_CODE.fd"; echo "/usr/share/OVMF/OVMF_VARS.fd"; return 0; }
+  elif [[ "$arch" == "aarch64" ]]; then
+    if [[ -f /usr/share/AAVMF/AAVMF_CODE.fd && -f /usr/share/AAVMF/AAVMF_VARS.fd ]]; then
+      echo "/usr/share/AAVMF/AAVMF_CODE.fd"; echo "/usr/share/AAVMF/AAVMF_VARS.fd"; return 0
+    fi
+    if [[ -f /usr/share/edk2/aarch64/QEMU_EFI.fd ]]; then
+      echo "/usr/share/edk2/aarch64/QEMU_EFI.fd"; echo ""; return 0
+    fi
+  fi
+  return 1
+}
+
+# ---------- Zenity menus ----------
+pick_action(){
+  zenity --list --radiolist --title="QEMU VM Manager" --width=580 --height=340 \
+    --column="Pick" --column="Action" \
+    TRUE  "Create new VM" \
+    FALSE "Start existing VM" \
+    FALSE "Manage existing VM"
+}
+
+pick_arch(){
+  local default="x86_64" rows=()
+  for a in "${AVAILABLE[@]}"; do
+    rows+=($([[ $a == "$default" ]] && echo TRUE || echo FALSE) "$a" "${QEMU_BIN[$a]}")
+  done
+  zenity --list --radiolist --title="Choose CPU architecture" --width=600 --height=420 \
+    --column="Pick" --column="Arch" --column="Binary" "${rows[@]}"
+}
+
+select_iso(){ zenity --file-selection --title="Select installer ISO (optional)" --file-filter="ISO | *.iso" --filename="$HOME/" || true; }
+
+# ---------- Sliders with system limits ----------
+# Zenity --scale docs: set min/max/step/value. :contentReference[oaicite:0]{index=0}
+scale_vcpus(){
+  local cur="${1:-2}"
+  local host_all cores max v
+  host_all="$( (command -v nproc >/dev/null && nproc --all) || echo 1 )"   # installed logical CPUs  :contentReference[oaicite:1]{index=1}
+  cores=$(( host_all < 1 ? 1 : host_all ))
+  max="$cores"
+  (( cur > max )) && cur="$max"
+  v="$(zenity --scale --title="vCPUs" --text="Choose number of vCPUs (max = ${max})" --min-value=1 --max-value="$max" --step=1 --value="$cur")" || return 1
+  echo "$v"
+}
+scale_ram_mib(){
+  local cur="${1:-2048}"
+  local mem_kb mem_mb max v
+  mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 1048576)"  # kB  :contentReference[oaicite:2]{index=2}
+  mem_mb=$(( mem_kb / 1024 ))
+  max=$(( mem_mb > 256 ? mem_mb : 256 ))
+  (( cur > max )) && cur="$max"
+  v="$(zenity --scale --title="RAM (MiB)" --text="Choose RAM (MiB, max = ${max})" --min-value=256 --max-value="$max" --step=256 --value="$cur")" || return 1
+  echo "$v"
+}
+scale_disk_gib(){
+  # Slider for GiB; max = free space (GiB) on $VM_HOME filesystem.
+  local cur="${1:-20}"
+  local avail_bytes avail_gb max v
+  avail_bytes="$(df -B1 --output=avail "$VM_HOME" | tail -1 2>/dev/null | tr -d ' ')"  # bytes free  :contentReference[oaicite:3]{index=3}
+  [[ -z "$avail_bytes" ]] && avail_bytes=0
+  avail_gb=$(( avail_bytes / (1024*1024*1024) ))
+  max=$(( avail_gb > 1 ? avail_gb : 1 ))
+  (( cur > max )) && cur="$max"
+  v="$(zenity --scale --title="Disk size (GiB)" --text="Choose primary disk size (qcow2 thin; max = ${max} GiB free)" \
+       --min-value=1 --max-value="$max" --step=1 --value="$cur")" || return 1
+  echo "$v"
+}
+
+# ---------- Config helpers ----------
+write_conf(){
+  local path="$1"; shift
+  cat >"$path" <<EOF
+# VM config for qemu-zenity-vm.sh
+VM_NAME="$1"
+ARCH="$2"
+QEMU_BIN="$3"
+CPUS="$4"
+RAM_MB="$5"
+DISK="$6"
+ISO="$7"
+UEFI_CODE="$8"
+UEFI_VARS="$9"
+GFX_ACCEL="${10}"   # "none" or "virgl"
+EOF
+}
+update_conf_key(){
+  local file="$1" key="$2" val="$3"
+  if grep -q "^${key}=" "$file"; then
+    sed -i -E "s|^(${key}=).*|\1\"${val//\//\\/}\"|" "$file"
+  else
+    printf '%s="%s"\n' "$key" "$val" >> "$file"
+  fi
+}
+have_device(){ local bin="$1" dev="$2"; "$bin" -device help 2>/dev/null | awk '{print $1}' | grep -qx "$dev"; }
+detect_img_fmt(){ local f="$1"; local line fmt; line="$(qemu-img info "$f" 2>/dev/null | grep -i '^file format:')" || true; fmt="${line##*: }"; [[ -n "$fmt" ]] && echo "$fmt" || echo "qcow2"; }
+
+assemble_3d_args(){
+  local arch="$1" bin="$2" choice="$3"
+  if [[ "$choice" != "virgl" ]]; then echo "-display gtk"; return; fi
+  if [[ "$arch" =~ ^(x86_64|i386)$ ]] && have_device "$bin" "virtio-vga-gl"; then
+    echo "-display gtk,gl=on -vga none -device virtio-vga-gl"
+  elif have_device "$bin" "virtio-gpu-gl-pci"; then
+    echo "-display gtk,gl=on -device virtio-gpu-gl-pci"
+  else
+    echo "-display gtk"  # fallback silently
+  fi
+}
+
+# ---------- VM actions ----------
+run_vm(){
+  local vm_dir="$1"
+  [[ -f "$vm_dir/vm.conf" ]] || { msg_err "vm.conf missing in $vm_dir"; return 1; }
+  # shellcheck disable=SC1090
+  source "$vm_dir/vm.conf"
+
+  local accel="-accel tcg,thread=multi"
+  if [[ "$(uname -m)" == "$ARCH" && -e /dev/kvm && -r /dev/kvm ]]; then accel="-accel kvm"; fi
+
+  local machine_opts=()
+  case "$ARCH" in
+    aarch64|arm|riscv64) machine_opts=(-machine virt) ;;
+    s390x) machine_opts=(-machine s390-ccw-virtio) ;;
+    *) machine_opts=() ;;
+  esac
+
+  local pflash_opts=()
+  if [[ -n "${UEFI_CODE:-}" && -f "${UEFI_CODE:-/n}" ]]; then
+    if [[ -n "${UEFI_VARS:-}" && -f "${UEFI_VARS:-/n}" ]]; then
+      pflash_opts=(-drive if=pflash,format=raw,unit=0,readonly=on,file="$UEFI_CODE" -drive if=pflash,format=raw,unit=1,file="$UEFI_VARS")
+    else
+      pflash_opts=(-drive if=pflash,format=raw,readonly=on,file="$UEFI_CODE")
+    fi
+  fi
+
+  local display_and_gpu; display_and_gpu="$(assemble_3d_args "$ARCH" "$QEMU_BIN" "${GFX_ACCEL:-none}")"
+
+  local args=(
+    "$QEMU_BIN" $accel
+    -name "$VM_NAME"
+    "${machine_opts[@]}"
+    -m "$RAM_MB"
+    -smp "$CPUS"
+    -boot menu=on
+    -nic user
+    -drive file="$DISK",if=virtio,format=qcow2,cache=writeback
+    ${display_and_gpu}
+    "${pflash_opts[@]}"
+  )
+
+  local list="$vm_dir/extra_disks.list"
+  if [[ -f "$list" ]]; then
+    while IFS= read -r d; do
+      [[ -z "$d" || "$d" =~ ^# ]] && continue
+      local fmt; fmt="$(detect_img_fmt "$d")"
+      args+=(-drive "file=$d,if=virtio,format=$fmt,cache=writeback")
+    done < "$list"
+  fi
+
+  if [[ -n "${ISO:-}" && -f "$ISO" ]]; then args+=(-cdrom "$ISO"); fi
+  "${args[@]}"
+}
+
+create_vm(){
+  local name arch arch_bin cpus ram_mb disk_gb iso
+  name="$(zenity --entry --title="New VM" --text="Enter a VM name:")" || return 0
+  name="$(sanitize_name "${name:-}")"; [[ -z "$name" ]] && { msg_err "Name is required."; return 1; }
+  local vm_dir="$VM_HOME/$name"; [[ -e "$vm_dir" ]] && { msg_err "Folder already exists: $vm_dir"; return 1; }
+  mkdir -p "$vm_dir"
+
+  arch="$(pick_arch)" || return 0; [[ -z "$arch" ]] && { msg_err "Architecture is required."; return 1; }
+  arch_bin="${QEMU_BIN[$arch]}"
+
+  cpus="$(scale_vcpus 2)" || return 0
+  ram_mb="$(scale_ram_mib 2048)" || return 0
+  disk_gb="$(scale_disk_gib 20)" || return 0
+  iso="$(select_iso || true)"; iso="${iso:-}"
+
+  local uefi_code="" uefi_vars_template=""
+  if detect_uefi "$arch" >/tmp/_uefi_paths.$$ 2>/dev/null; then
+    read -r uefi_code < /tmp/_uefi_paths.$$
+    read -r uefi_vars_template < <(tail -n +2 /tmp/_uefi_paths.$$ || true)
+    rm -f /tmp/_uefi_paths.$$
+    zenity --question --title="UEFI firmware" --text="UEFI detected for $arch.\nUse UEFI (OVMF/AAVMF)?" || { uefi_code=""; uefi_vars_template=""; }
+  fi
+
+  local disk_path="$vm_dir/disk.qcow2"
+  qemu-img create -f qcow2 "$disk_path" "${disk_gb}G" >/dev/null || { msg_err "Failed to create disk image."; return 1; }
+
+  local uefi_vars=""
+  [[ -n "$uefi_vars_template" && -f "$uefi_vars_template" ]] && { uefi_vars="$vm_dir/uefi_vars.fd"; cp -n "$uefi_vars_template" "$uefi_vars"; }
+
+  : > "$vm_dir/extra_disks.list"
+  write_conf "$vm_dir/vm.conf" "$name" "$arch" "$arch_bin" "$cpus" "$ram_mb" "$disk_path" "$iso" "$uefi_code" "$uefi_vars" "none"
+
+  if zenity --question --title="VM created" --text="VM '$name' created.\nStart it now?"; then run_vm "$vm_dir"; fi
+}
+
+# Return PATH only (column 8). Zenity lists print column 1 by default; we override. :contentReference[oaicite:4]{index=4}
+pick_vm_path(){
+  local title="$1"
+  shopt -s nullglob
+  local rows=() have=0
+  for d in "$VM_HOME"/*; do
+    [[ -d "$d" && -f "$d/vm.conf" ]] || continue
+    # shellcheck disable=SC1090
+    source "$d/vm.conf"
+    rows+=("$VM_NAME" "$ARCH" "$RAM_MB" "$CPUS" "$DISK" "$ISO" "${GFX_ACCEL:-none}" "$d")
+    have=1
+  done
+  [[ $have -eq 0 ]] && { msg_err "No existing VMs found in $VM_HOME"; return 1; }
+  zenity --list --title="$title" --width=980 --height=460 \
+    --column="Name" --column="Arch" --column="RAM(MiB)" --column="CPU" \
+    --column="Disk" --column="ISO" --column="3D" --column="Path" \
+    --print-column=8 \
+    "${rows[@]}"
+}
+
+start_existing(){ local path; path="$(pick_vm_path "Start existing VM")" || return 0; [[ -z "$path" ]] && return 0; run_vm "$path"; }
+
+delete_vm_path(){
+  local path="$1"
+  if [[ -z "$path" || ! -f "$path/vm.conf" || "${path#$VM_HOME/}" == "$path" ]]; then
+    msg_err "Refusing to delete: not a managed VM path.\n($path)"; return 1
+  fi
+  if zenity --question --title="Delete VM" --text="Really delete this VM and all files?\n$path"; then
+    rm -rf -- "$path"
+  fi
+}
+
+edit_cpu_ram(){
+  local vm_dir="$1"; source "$vm_dir/vm.conf"
+  local new_cpus new_ram
+  new_cpus="$(scale_vcpus "$CPUS")" || return 0
+  new_ram="$(scale_ram_mib "$RAM_MB")" || return 0
+  update_conf_key "$vm_dir/vm.conf" CPUS "$new_cpus"
+  update_conf_key "$vm_dir/vm.conf" RAM_MB "$new_ram"
+}
+
+add_new_disk(){
+  local vm_dir="$1" size_gb idx=1 f
+  size_gb="$(scale_disk_gib 10)" || return 0
+  while :; do f="$vm_dir/disk$((idx)).qcow2"; [[ -e "$f" ]] || break; idx=$((idx+1)); done
+  qemu-img create -f qcow2 "$f" "${size_gb}G" >/dev/null || { msg_err "Failed to create $f"; return 1; }
+  echo "$f" >> "$vm_dir/extra_disks.list"
+}
+attach_existing_disk(){
+  local vm_dir="$1" f
+  f="$(zenity --file-selection --title="Attach existing disk image" --filename="$HOME/")" || return 0
+  [[ -z "$f" ]] && return 0
+  echo "$f" >> "$vm_dir/extra_disks.list"
+}
+list_disks_menu(){
+  local vm_dir="$1"; source "$vm_dir/vm.conf"
+  local rows=("$DISK (primary)")
+  if [[ -f "$vm_dir/extra_disks.list" ]]; then
+    while IFS= read -r d; do [[ -z "$d" || "$d" =~ ^# ]] && continue; rows+=("$d"); done < "$vm_dir/extra_disks.list"
+  fi
+  zenity --list --title="Select disk" --column="Disk image path" --height=420 --width=900 "${rows[@]}"
+}
+
+grow_disk(){
+  local vm_dir="$1" sel cur_bytes cur_gb avail_bytes avail_gb max new_gb
+  sel="$(list_disks_menu "$vm_dir")" || return 0
+  [[ -z "$sel" ]] && return 0
+  cur_bytes="$(qemu-img info "$sel" | sed -n 's/.*virtual size:.*(\([0-9]\+\) bytes).*/\1/p')"
+  [[ -z "$cur_bytes" ]] && cur_bytes=0
+  cur_gb=$(( cur_bytes / (1024*1024*1024) ))
+  (( cur_gb < 1 )) && cur_gb=1
+  avail_bytes="$(df -B1 --output=avail "$VM_HOME" | tail -1 2>/dev/null | tr -d ' ')"
+  [[ -z "$avail_bytes" ]] && avail_bytes=0
+  avail_gb=$(( avail_bytes / (1024*1024*1024) ))
+  max=$(( cur_gb + (avail_gb > 0 ? avail_gb : 0) ))
+  (( max < cur_gb )) && max="$cur_gb"
+  new_gb="$(zenity --scale --title="Grow disk" --text="Grow virtual size (GiB)\nCurrent: ${cur_gb} GiB\nMax (free): ${max} GiB" \
+            --min-value="$cur_gb" --max-value="$max" --step=1 --value="$cur_gb")" || return 0
+  [[ -z "$new_gb" || "$new_gb" -le "$cur_gb" ]] && return 0
+  qemu-img resize "$sel" "${new_gb}G" >/dev/null || msg_err "Resize failed."
+}
+
+detach_disk(){
+  local vm_dir="$1" sel
+  sel="$(list_disks_menu "$vm_dir")" || return 0
+  [[ -z "$sel" ]] && return 0
+  if [[ "$sel" =~ \(primary\)$ ]]; then msg_err "Refusing to detach primary disk."; return 1; fi
+  if [[ -f "$vm_dir/extra_disks.list" ]]; then
+    grep -Fxv -- "$sel" "$vm_dir/extra_disks.list" > "$vm_dir/.tmp.$$" || true
+    mv "$vm_dir/.tmp.$$" "$vm_dir/extra_disks.list"
+  fi
+  if [[ "$sel" == "$vm_dir/"* ]] && zenity --question --title="Delete file?" --text="Detach done.\nAlso delete disk file?\n$sel"; then
+    rm -f -- "$sel"
+  fi
+}
+
+toggle_3d(){
+  local vm_dir="$1"; source "$vm_dir/vm.conf"
+  local current="${GFX_ACCEL:-none}" choice
+  choice="$(zenity --list --radiolist --title="3D acceleration (VirGL)" --height=220 \
+    --column="Pick" --column="Mode" --column="Notes" \
+    $([[ "$current" == "none" ]] && echo TRUE || echo FALSE) "none"  "No OpenGL acceleration" \
+    $([[ "$current" == "virgl" ]] && echo TRUE || echo FALSE) "virgl" "virtio-gpu (GL) + -display gtk,gl=on")" || return 0
+  [[ -z "$choice" ]] && return 0
+  update_conf_key "$vm_dir/vm.conf" GFX_ACCEL "$choice"
+}
+
+manage_storage(){
+  local vm_dir="$1" action
+  action="$(zenity --list --radiolist --title="Manage storage" --width=560 --height=300 \
+     --column="Pick" --column="Action" TRUE "Add new disk" FALSE "Attach existing disk" FALSE "Grow a disk" FALSE "Detach a disk")" || return 0
+  case "$action" in
+    "Add new disk") add_new_disk "$vm_dir" ;;
+    "Attach existing disk") attach_existing_disk "$vm_dir" ;;
+    "Grow a disk") grow_disk "$vm_dir" ;;
+    "Detach a disk") detach_disk "$vm_dir" ;;
+  esac
+}
+
+manage_vm(){
+  # Loop so actions (including delete) return here without quitting the app
+  while true; do
+    local path; path="$(pick_vm_path "Manage existing VM")" || return 0
+    [[ -z "$path" ]] && return 0
+    local action; action="$(zenity --list --radiolist --title="Manage VM" --width=620 --height=380 \
+       --column="Pick" --column="Action" \
+       TRUE "Edit CPU/RAM" FALSE "Manage storage" FALSE "Toggle 3D acceleration" FALSE "Start now" FALSE "Delete this VM" \
+    )" || return 0
+    case "$action" in
+      "Edit CPU/RAM") edit_cpu_ram "$path" ;;
+      "Manage storage") manage_storage "$path" ;;
+      "Toggle 3D acceleration") toggle_3d "$path" ;;
+      "Start now") run_vm "$path" ;;
+      "Delete this VM") delete_vm_path "$path" ;;
+    esac
+  done
+}
+
+main_menu(){
+  while true; do
+    local action; action="$(pick_action || true)"
+    case "$action" in
+      "Create new VM") create_vm ;;
+      "Start existing VM") start_existing ;;
+      "Manage existing VM") manage_vm ;;
+      ""|*) break ;;  # Close dialog or cancel exits the loop
+    esac
+  done
+}
+
+main_menu
