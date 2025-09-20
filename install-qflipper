@@ -7,7 +7,7 @@ else
   sudo dnf install -y flatpak 
   clear
 fi
-flatpak install --user flathub one.flipperzero.qFlipper -y
+flatpak install flathub one.flipperzero.qFlipper -y
 echo '#Flipper Zero serial port
 SUBSYSTEMS=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", ATTRS{manufacturer}=="Flipper Devices Inc.", TAG+="uaccess"
 #Flipper Zero DFU
