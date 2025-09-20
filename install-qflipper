@@ -3,8 +3,8 @@ if command -v flatpak &> /dev/null
 then
   echo "flatpak is installed" > /dev/null
 else
-  sudo pacman -Syyu --noconfirm
-  sudo pacman -S flatpak --noconfirm
+  sudo dnf update -y
+  sudo dnf install -y flatpak 
   clear
 fi
 flatpak install --user flathub one.flipperzero.qFlipper -y
