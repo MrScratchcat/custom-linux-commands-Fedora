@@ -19,5 +19,5 @@ sudo cp 42-flipperzero.rules /etc/udev/rules.d/42-flipperzero.rules
 rm 42-flipperzero.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger
-sudo usermod -a -G uucp $USER
+sudo usermod -a -G dialout $USER
 echo "You may need to reboot."
