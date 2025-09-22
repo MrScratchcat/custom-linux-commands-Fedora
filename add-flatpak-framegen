@@ -1,0 +1,171 @@
+#!/bin/bash
+
+# Get the current username for the default path
+USERNAME=$(whoami)
+LOSSESS_PATH="/home/$USERNAME/.local/share/Steam/steamapps/common/Lossless Scaling"
+
+# Function to get a list of installed flatpaks and let the user choose one
+select_flatpak() {
+  # Create a temporary file to store the app list
+  TEMP_FILE=$(mktemp)
+  
+  # Get list of user and system flatpaks with just name and application ID
+  flatpak list --app --columns=application,name | tail -n +2 | sort -k2 > "$TEMP_FILE"
+  
+  # Extract just the names for display (properly handling spaces)
+  APP_NAMES=()
+  while IFS=$'\t' read -r app_id name; do
+    APP_NAMES+=("$name")
+  done < "$TEMP_FILE"
+  
+  # Let the user select an application using Zenity with proper array handling
+  SELECTED_NAME=$(zenity --list \
+    --title="Select Flatpak Application" \
+    --text="Choose the application to configure Framegen for:" \
+    --column="Application Name" "${APP_NAMES[@]}" \
+    --height=400 --width=500)
+
+  # Check if user cancelled
+  if [ $? -ne 0 ] || [ -z "$SELECTED_NAME" ]; then
+    zenity --error --text="No application selected. Exiting."
+    rm "$TEMP_FILE"
+    exit 1
+  fi
+
+  # Find the application ID for the selected name (handling spaces properly)
+  APP_ID=$(grep -F "$SELECTED_NAME" "$TEMP_FILE" | awk -F'\t' '{print $1}' | head -1)
+  
+  rm "$TEMP_FILE"
+  
+  if [ -z "$APP_ID" ]; then
+    zenity --error --text="Could not find application ID for selected application."
+    exit 1
+  fi
+  
+  echo "$APP_ID"
+}
+
+# Function to check if the path already has filesystem access
+check_existing_filesystem_access() {
+  local app_id=$1
+  local path_to_check="$2"
+  
+  # Check current filesystem overrides
+  CURRENT_OVERRIDES=$(flatpak override --show "$app_id" 2>/dev/null || flatpak override --show --system "$app_id" 2>/dev/null)
+  
+  # Check if the specific path is already in the filesystem overrides
+  if echo "$CURRENT_OVERRIDES" | grep -q "filesystems=.*$path_to_check"; then
+    echo "exists"
+  else
+    echo "not_exists"
+  fi
+}
+
+# Function to build the final flatpak override command
+build_override_command() {
+  local app_id=$1
+  local env_vars=$2
+  local filesystem_access=$3
+  
+  # Check if the app is a user or system installation to use the correct override flag
+  if flatpak info "$app_id" | grep -q "Context: .*system"; then
+    user_override="--system"
+  else
+    user_override="--user"
+  fi
+
+  # Build the command
+  echo "flatpak override $user_override $filesystem_access $env_vars $app_id"
+}
+
+# Main script execution
+
+# 1. Select the Flatpak application
+APP_ID=$(select_flatpak)
+if [ -z "$APP_ID" ]; then exit 1; fi
+
+# 2. Check if the Lossless Scaling path already has filesystem access
+FS_ACCESS_STATUS=$(check_existing_filesystem_access "$APP_ID" "$LOSSESS_PATH")
+
+# 3. Start building the environment variable and filesystem access strings
+ENV_VARS=""
+FS_ACCESS=""
+
+# 4. Add filesystem access for Lossless Scaling path if it doesn't exist
+if [ "$FS_ACCESS_STATUS" = "not_exists" ]; then
+  FS_ACCESS="--filesystem=\"$LOSSESS_PATH\""
+  zenity --info --text="Adding filesystem access to:\n$LOSSESS_PATH" --width=400
+else
+  zenity --info --text="Filesystem access already exists for:\n$LOSSESS_PATH" --width=400
+fi
+
+# 5. Add the legacy variable always (as per your requirement)
+ENV_VARS="--env=LSFG_LEGACY=1"
+
+# 6. Present options to the user via Zenity
+
+# LSFG_MULTIPLIER
+MULTIPLIER=$(zenity --scale \
+  --title="Framegen Multiplier" \
+  --text="Set LSFG_MULTIPLIER (2-20):" \
+  --min-value=2 --max-value=20 --value=2 --step=1)
+if [ $? -eq 0 ]; then
+    ENV_VARS="$ENV_VARS --env=LSFG_MULTIPLIER=$MULTIPLIER"
+fi
+
+# LSFG_PERFORMANCE_MODE
+PERF_MODE=$(zenity --list --radiolist \
+  --title="Performance Mode" \
+  --text="Set LSFG_PERFORMANCE_MODE:" \
+  --column="Select" --column="Mode" --column="Value" \
+  TRUE "Quality (0)" 0 \
+  FALSE "Performance (1)" 1 \
+  --hide-column=3 --print-column=3)
+if [ $? -eq 0 ] && [ -n "$PERF_MODE" ]; then
+    ENV_VARS="$ENV_VARS --env=LSFG_PERFORMANCE_MODE=$PERF_MODE"
+fi
+
+# LSFG_HDR_MODE
+HDR_MODE=$(zenity --list --radiolist \
+  --title="HDR Mode" \
+  --text="Set LSFG_HDR_MODE:" \
+  --column="Select" --column="Mode" --column="Value" \
+  TRUE "Off (0)" 0 \
+  FALSE "On (1)" 1 \
+  --hide-column=3 --print-column=3)
+if [ $? -eq 0 ] && [ -n "$HDR_MODE" ]; then
+    ENV_VARS="$ENV_VARS --env=LSFG_HDR_MODE=$HDR_MODE"
+fi
+
+# LSFG_EXPERIMENTAL_PRESENT_MODE
+PRESENT_MODE=$(zenity --list --radiolist \
+  --title="Experimental Present Mode" \
+  --text="Set LSFG_EXPERIMENTAL_PRESENT_MODE:" \
+  --column="Select" --column="Mode" --column="Value" \
+  TRUE "fifo" fifo \
+  FALSE "vsync" vsync \
+  FALSE "mailbox" mailbox \
+  FALSE "immediate" immediate \
+  --hide-column=3 --print-column=3)
+if [ $? -eq 0 ] && [ -n "$PRESENT_MODE" ]; then
+    ENV_VARS="$ENV_VARS --env=LSFG_EXPERIMENTAL_PRESENT_MODE=$PRESENT_MODE"
+fi
+
+# 7. Build and show the final command for confirmation
+FINAL_CMD=$(build_override_command "$APP_ID" "$ENV_VARS" "$FS_ACCESS")
+
+# Ask for final confirmation
+zenity --question \
+  --title="Confirm Configuration" \
+  --text="The following command is about to run:\n\n$FINAL_CMD\n\nDo you want to proceed?" \
+  --ok-label="Apply" --cancel-label="Cancel" \
+  --width=500
+
+# 8. Execute the command if confirmed
+if [ $? -eq 0 ]; then
+  echo "Executing: $FINAL_CMD"
+  eval "$FINAL_CMD"
+  zenity --info --text="Framegen configuration successfully applied to $APP_ID!\n\nYou can now see the path in Flatseal under 'Filesystem' → 'Other files'." --width=400
+else
+  zenity --info --text="Configuration cancelled." --width=200
+fi
