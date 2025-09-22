@@ -12,17 +12,17 @@ select_flatpak() {
   # Get list of user and system flatpaks with just name and application ID
   flatpak list --app --columns=application,name | tail -n +2 | sort -k2 > "$TEMP_FILE"
   
-  # Extract just the names for display (properly handling spaces)
-  APP_NAMES=()
+  # Use a while loop to properly handle spaces in names
+  zenity_list_options=()
   while IFS=$'\t' read -r app_id name; do
-    APP_NAMES+=("$name")
+    zenity_list_options+=("$name")
   done < "$TEMP_FILE"
   
-  # Let the user select an application using Zenity with proper array handling
-  SELECTED_NAME=$(zenity --list \
+  # Use printf to properly format the list for Zenity
+  SELECTED_NAME=$(printf '%s\n' "${zenity_list_options[@]}" | zenity --list \
     --title="Select Flatpak Application" \
     --text="Choose the application to configure Framegen for:" \
-    --column="Application Name" "${APP_NAMES[@]}" \
+    --column="Application Name" \
     --height=400 --width=500)
 
   # Check if user cancelled
