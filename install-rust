@@ -1,0 +1,16 @@
+#!/bin/bash
+if command -v curl &> /dev/null
+then
+  echo "curl is installed" > /dev/null
+else
+  sudo dnf install curl -y
+  clear
+fi
+sudo dnf install cargo -y
+curl https://sh.rustup.rs -sSf | sh -s -- -y
+if ! grep -q "export PATH="$HOME/.cargo/bin:$PATH" ~/.bash_profile; then
+    echo 'export PATH="$HOME/.cargo/bin:$PATH" >> bash_profile' >> ~/.bash_profile
+    echo "done"
+else
+    echo "done"
+fi
