@@ -1,0 +1,225 @@
+#!/bin/bash
+# Ollama & Open-WebUI Docker Deployment Script
+set -e
+echo "Starting Ollama and Open-WebUI Docker setup..."
+# Function to install Docker based on OS
+install_docker() {
+    echo "Docker not found. Installing Docker..."
+
+    # Detect package manager and distribution
+    if command -v apt-get &> /dev/null; then
+        # Debian/Ubuntu
+        sudo apt-get update
+        sudo apt-get install -y docker.io
+    elif command -v dnf &> /dev/null; then
+        # Fedora/RHEL/CentOS
+        sudo dnf -y install dnf-plugins-core
+        sudo dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo
+        sudo dnf -y install docker-ce docker-ce-cli containerd.io
+    elif command -v pacman &> /dev/null; then
+        # Arch Linux
+        sudo pacman -Sy --noconfirm docker
+    elif [ -f /etc/os-release ]; then
+        # RPM-OSTree distributions (Fedora Silverblue, etc.)
+        echo "Docker is not natively supported on RPM-OSTree systems."
+        echo "Consider using Podman with rootless mode instead:"
+        echo "  podman pull docker.io/ollama/ollama"
+        exit 1
+    elif command -v apk &> /dev/null; then
+        # Alpine Linux
+        sudo apk add --no-cache docker-cli
+        if [ ! -f /etc/docker/daemon.json ]; then
+            echo '{"debug": true, "storage-driver": "overlay2"}' | sudo tee /etc/docker/daemon.json
+        fi
+    else
+        echo "Error: Could not identify package manager or distribution."
+        exit 1
+    fi
+
+    # Start and enable Docker service
+    if command -v systemctl &> /dev/null; then
+        sudo systemctl start docker
+        sudo systemctl enable docker
+    else
+        echo "Warning: Could not find systemd, Docker may not start automatically"
+    fi
+    echo "Docker installed successfully."
+}
+# Function to detect GPU type
+detect_gpu() {
+    if lspci | grep -i "NVIDIA" &> /dev/null; then
+        echo "nvidia"
+    elif lspci | grep -i "AMD" &> /dev/null || lspci | grep -i "Radeon" &> /dev/null; then
+        echo "amd"
+    elif lspci | grep -i "Intel" &> /dev/null; then
+        echo "intel"
+    else
+        echo "none"
+    fi
+}
+# Function to create and install the ollama-pull command
+install_ollama_pull_command() {
+    echo "Creating and installing the ollama-pull command..."
+    # Create the script in the current directory
+    cat > ollama-pull << 'EOF'
+#!/bin/bash
+if [ -z "$1" ]; then
+    echo "Usage: ollama-pull <model_name>"
+    exit 1
+fi
+# Check if we're using Podman on RPM-OSTree system
+if [ -f /etc/os-release ] && grep -q "ID=fedora.*OSTree" /etc/os-release; then
+    sudo podman exec ollama ollama pull "$1"
+else
+    sudo docker exec -it ollama ollama pull "$1"
+fi
+EOF
+    # Make the script executable
+    chmod +x ollama-pull
+    # Move it to /bin (requires sudo)
+    sudo mv ollama-pull /bin/
+    echo "ollama-pull command has been installed to /bin/"
+    sudo chmod +x /bin/ollama-pull
+}
+# Check if Docker is installed, install if not
+if ! command -v docker &> /dev/null && ! command -v podman &> /dev/null; then
+    install_docker
+else
+    echo "Docker (or alternative) is already installed."
+fi
+
+# Detect GPU
+GPU_TYPE=$(detect_gpu)
+echo "Detected GPU type: $GPU_TYPE"
+
+# Handle special cases for RPM-OSTree or Podman
+if [ -f /etc/os-release ] && grep -q "ID=fedora.*OSTree" /etc/os-release; then
+    echo "Detected RPM-OSTree system (Fedora Silverblue, etc.)"
+    echo "Using Podman instead of Docker for compatibility with the immutable base"
+    # Check if we need to install podman
+    if ! command -v podman &> /dev/null; then
+        echo "Installing Podman..."
+        sudo dnf -y install podman
+    fi
+
+    # Install nvidia-container-toolkit for NVIDIA GPUs with Podman
+    if [ "$GPU_TYPE" = "nvidia" ]; then
+        echo "Installing nvidia-container-toolkit for Podman..."
+        sudo dnf -y install nvidia-container-toolkit
+        sudo usermod --add-groups $USER nvidia-docker
+    fi
+
+    # Run containers with podman instead of docker
+    CONTAINER_TOOL="podman"
+else
+    # Default to Docker on other systems
+    CONTAINER_TOOL="docker"
+
+    # Install NVIDIA Container Toolkit if an NVIDIA GPU is found
+    if [ "$GPU_TYPE" = "nvidia" ]; then
+        echo "Installing NVIDIA Container Toolkit..."
+
+        # Alpine needs special handling
+        if command -v apk &> /dev/null; then
+            sudo apk add --no-cache nvidia-container-toolkit
+        elif command -v dnf &> /dev/null || command -v yum &> /dev/null; then
+            sudo $([ -f /etc/os-release ] && grep -q "ID=fedora" /etc/os-release && echo "dnf" || echo "yum") -y install nvidia-container-toolkit
+        else
+            echo "Please install the 'nvidia-container-toolkit' package for your distribution manually."
+            exit 1
+        fi
+
+        # Configure Docker to use the NVIDIA runtime
+        if command -v nvidia-ctk &> /dev/null; then
+            sudo nvidia-ctk runtime configure --runtime=docker
+            sudo systemctl restart docker
+            echo "NVIDIA Container Toolkit configured and Docker restarted."
+        else
+            echo "Warning: Could not find nvidia-ctk to configure NVIDIA support"
+        fi
+    fi
+fi
+
+# Run Ollama container based on GPU type
+echo "Pulling and starting the Ollama container..."
+case $GPU_TYPE in
+    "nvidia")
+        if [ "$CONTAINER_TOOL" = "podman" ]; then
+            sudo podman run -d --device /dev/nvidia-uvm --device /dev/nvidia0 \
+                -v ollama:/root/.ollama -p 11434:11434 --restart always --name ollama \
+                docker.io/ollama/ollama
+        else
+            sudo docker run -d --gpus=all -v ollama:/root/.ollama -p 11434:11434 \
+                --restart always --name ollama ollama/ollama
+        fi
+        ;;
+    "amd")
+        if [ "$CONTAINER_TOOL" = "podman" ]; then
+            sudo podman run -d --device /dev/kfd --device /dev/dri \
+                -v ollama:/root/.ollama -p 11434:11434 --restart always --name ollama \
+                docker.io/ollama/ollama:rocm
+        else
+            sudo docker run -d --device /dev/kfd --device /dev/dri \
+                -v ollama:/root/.ollama -p 11434:11434 --restart always --name ollama \
+                ollama/ollama:rocm
+        fi
+        ;;
+    *)
+        # Default command for Intel iGPU or no dedicated GPU
+        if [ "$CONTAINER_TOOL" = "podman" ]; then
+            sudo podman run -d -v ollama:/root/.ollama -p 11434:11434 \
+                --restart always --name ollama docker.io/ollama/ollama
+        else
+            sudo docker run -d -v ollama:/root/.ollama -p 11434:11434 \
+                --restart always --name ollama ollama/ollama
+        fi
+        ;;
+esac
+echo "Ollama container started successfully."
+
+# Install Open-WebUI (using the same container tool)
+echo "Pulling and starting the Open-WebUI container..."
+if [ "$CONTAINER_TOOL" = "podman" ]; then
+    sudo podman run -d -p 3000:8080 --add-host=host.docker.internal:host-gateway \
+        -v open-webui:/app/backend/data --name open-webui --restart always \
+        docker.io/ghcr.io/open-webui/open-webui:main
+else
+    sudo docker run -d -p 3000:8080 --add-host=host.docker.internal:host-gateway \
+        -v open-webui:/app/backend/data --name open-webui --restart always \
+        ghcr.io/open-webui/open-webui:main
+fi
+echo "Open-WebUI container started successfully. Access it at http://localhost:3000"
+
+# Create and install the ollama-pull command
+install_ollama_pull_command
+
+# Ask about auto-updates
+read -p "Do you want to enable auto-updates for containers using Watchtower? (y/N): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "Starting Watchtower container for auto-updates..."
+    if [ "$CONTAINER_TOOL" = "podman" ]; then
+        sudo podman run -d \
+            --name watchtower --restart always \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e WATCHTOWER_CLEANUP=true \
+            -e WATCHTOWER_POLL_INTERVAL=300 \
+            docker.io/containrrr/watchtower
+    else
+        sudo docker run -d \
+            --name watchtower --restart always \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e WATCHTOWER_CLEANUP=true \
+            -e WATCHTOWER_POLL_INTERVAL=300 \
+            containrrr/watchtower
+    fi
+    echo "Watchtower started. It will check for updates every 300 seconds (5 minutes)."
+else
+    echo "Auto-updates skipped."
+fi
+
+echo ""
+echo "=== Setup Complete ==="
+echo "Ollama is running and accessible on port 11434."
+echo "Open-WebUI is running and accessible at http://localhost:3000"
+echo "You can use the 'ollama-pull' command to download models, e.g., 'ollama-pull stable-diffusion'"
