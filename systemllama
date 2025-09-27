@@ -22,8 +22,10 @@ DEEPSEEK_DEFAULT_MODEL="deepseek-chat"  # Default DeepSeek model
 # === OTHER SETTINGS ===
 OLLAMA_BASE_URL="http://localhost:11434"  # Ollama server URL
 WEB_SEARCH_ENABLED=true                    # Enable web search by default (true/false)
-WEB_SEARCH_SITES=10                        # Number of search results to fetch (max 11)
-OLLAMA_KEEP_ALIVE="30m"                   # Keep Ollama model in memory after load
+OLLAMA_KEEP_ALIVE="5m"                   # Keep Ollama model in memory after load
+
+# Web search settings
+OLLAMA_API_KEY=""                     # Your Ollama API key (if required)
 
 # Initialize variables (using config values from above)
 BASE_URL="$OLLAMA_BASE_URL"
@@ -37,7 +39,6 @@ OS_VERSION=""
 DESKTOP_ENVIRONMENT=""
 PACKAGE_MANAGER=""
 OS_FAMILY=""
-sites=$WEB_SEARCH_SITES
 
 # API URLs and settings (respect environment variables if already set)
 OPENAI_API_KEY="${OPENAI_API_KEY:-}"
@@ -58,9 +59,17 @@ ANTHROPIC_VERSION="${ANTHROPIC_VERSION:-2023-06-01}"
 
 DEEPSEEK_MODELS_URL="${DEEPSEEK_MODELS_URL:-https://api.deepseek.com/v1/models}"
 
+if [ -n "$OLLAMA_API_KEY" ]; then
+    echo "Using Ollama API key"
+    search_mode="ollama"
+else
+    echo "Ollama API key is not set"
+    search_mode="ddgr"
+fi
+
 # Check and install dependencies based on detected package manager
 check_and_install_deps() {
-    local deps=("ddgr" "jq" "curl" "zenity")
+    local deps=("jq" "curl" "zenity")
     local missing_deps=()
     
     # Check which dependencies are missing
@@ -307,7 +316,8 @@ check_internet() {
 }
 
 # Perform web search using ddgr
-perform_web_search() {
+perform_web_search_ddgr() {
+    echo "Using ddgr for web search"
     local query="$1"
     local search_results=""
     
@@ -333,6 +343,39 @@ perform_web_search() {
     
     # Perform search with ddgr using python3 - let it return all requested results
     search_results=$(python3 $(which ddgr) --np -x -n $sites "$query" 2>/dev/null)
+    
+    if [[ -n "$search_results" ]]; then
+        echo "✓ Web search completed - found relevant results" >&2
+        echo "$search_results"
+        return 0
+    else
+        echo "⚠ No web search results found" >&2
+        return 1
+    fi
+}
+
+perform_web_search_ollama() {
+    echo "Using Ollama for web search"
+    local query="$1"
+    local search_results=""
+    if [ -z $OLLAMA_API_KEY ]; then
+        echo "Web search disabled: Ollama API key not set" >&2
+        return 1
+    fi
+
+    # Check internet connectivity
+    if ! check_internet; then
+        echo "Web search disabled: No internet connection" >&2
+        return 1
+    fi
+    
+    echo "🔍 Performing web search for: $query" >&2
+    curl https://ollama.com/api/web_search \
+    --header "Authorization: Bearer $OLLAMA_API_KEY" \
+        -d '{
+        "query":"'"${query}"'"
+        }' > /tmp/ollama_search_results.txt
+    search_results=$(cat /tmp/ollama_search_results.txt)
     
     if [[ -n "$search_results" ]]; then
         echo "✓ Web search completed - found relevant results" >&2
@@ -855,7 +898,14 @@ ask_ai() {
         local search_query=$(generate_search_term "$prompt_text" "$model")
         
         # Perform the search with AI-generated query
-        local search_results=$(perform_web_search "$search_query")
+        if [ $search_mode == "ddgr" ]; then
+            local search_results=$(perform_web_search_ddgr "$search_query")
+        elif [ $search_mode == "ollama" ]; then
+            local search_results=$(perform_web_search_ollama "$search_query")
+        else
+            echo "⚠ Unknown search mode: $search_mode. Skipping web search." >&2
+            local search_results=""
+        fi
         
         if [[ -n "$search_results" ]]; then
             search_context="=== Web Search Results for: $search_query ===\n$search_results\n\n"
