@@ -1,4 +1,5 @@
 #!/bin/bash
+sudo -v
 if command -v git &> /dev/null; then
     echo "Git is already installed"
 else
