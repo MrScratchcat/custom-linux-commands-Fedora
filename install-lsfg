@@ -1,0 +1,22 @@
+#!/bin/bash
+sudo -v
+sudo dnf upgrade -y
+sudo dnf install -y wget
+wget https://github.com/PancakeTAS/lsfg-vk/releases/download/v1.0.0/lsfg-vk-1.0.0.x86_64.rpm
+if command -v flatpak &> /dev/null
+then
+    wget https://github.com/PancakeTAS/lsfg-vk/releases/download/v1.0.0/org.freedesktop.Platform.VulkanLayer.lsfg_vk_25.08.flatpak
+    wget https://github.com/PancakeTAS/lsfg-vk/releases/download/v1.0.0/org.freedesktop.Platform.VulkanLayer.lsfg_vk_24.08.flatpak
+    wget https://github.com/PancakeTAS/lsfg-vk/releases/download/v1.0.0/org.freedesktop.Platform.VulkanLayer.lsfg_vk_23.08.flatpak
+    sudo flatpak install -y ./org.freedesktop.Platform.VulkanLayer.lsfg_vk_25.08.flatpak
+    sudo flatpak install -y ./org.freedesktop.Platform.VulkanLayer.lsfg_vk_24.08.flatpak
+    sudo flatpak install -y ./org.freedesktop.Platform.VulkanLayer.lsfg_vk_23.08.flatpak
+    rm org.freedesktop.Platform.VulkanLayer.lsfg_vk_25.08.flatpak
+    rm org.freedesktop.Platform.VulkanLayer.lsfg_vk_24.08.flatpak
+    rm org.freedesktop.Platform.VulkanLayer.lsfg_vk_23.08.flatpak
+else
+    echo "Flatpak is not installed. Skipping Flatpak installation."
+fi
+
+sudo dnf install -y ./lsfg-vk-1.0.0.x86_64.rpm
+rm lsfg-vk-1.0.0.x86_64.rpm 
