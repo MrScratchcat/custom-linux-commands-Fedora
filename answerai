@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Watches screenshot drops in /tmp/quickshell/media/cliphist, asks an Ollama
+# vision-capable model to describe them, and surfaces the reply via Hyprland
+# notifications (or Zenity as a fallback).
+
+set -euo pipefail
+
+WATCH_DIR="/tmp/quickshell/media/cliphist"
+PROMPT=${PROMPT:-"only display the awnser"}
+
+notify_user() {
+  local text=$1
+  if command -v hyprctl >/dev/null 2>&1; then
+    hyprctl notify 3 10000 "rgb(ffb52a)" "$text" >/dev/null 2>&1 && return
+  fi
+  if command -v zenity >/dev/null 2>&1; then
+    zenity --notification --text="$text" >/dev/null 2>&1 && return
+  fi
+  printf '%s\n' "$text"
+}
+
+require_cmd() {
+  local cmd=$1
+  command -v "$cmd" >/dev/null 2>&1 || {
+    printf 'Missing dependency: %s\n' "$cmd" >&2
+    exit 1
+  }
+}
+
+strip_thinking() {
+  local raw=$1
+  local has_marker=0
+  local cleaned
+  local last_block
+
+  # Detect common "thinking" markers.
+  if printf '%s' "$raw" | grep -qiE '(thinking\\.{3}|<think>|</think>|done thinking|thoughts?:)'; then
+    has_marker=1
+  fi
+
+  # Drop <think> blocks and explicit thinking lines.
+  cleaned=$(
+    printf '%s' "$raw" |
+      awk 'BEGIN{skip=0} /<think>/ {skip=1; next} /<\/think>/ {skip=0; next} skip==1 {next} {print}' |
+      sed -e '/[Tt]hinking\.\.\./d' -e '/done thinking\./d' -e '/^[[:space:]]*Thoughts\?:/d'
+  )
+
+  # Trim surrounding whitespace.
+  cleaned=$(printf '%s' "$cleaned" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+  # If we saw thinking markers, try to keep only the last paragraph.
+  if [[ $has_marker -eq 1 ]]; then
+    last_block=$(printf '%s' "$cleaned" | awk 'BEGIN{RS="";ORS="\n\n"}{last=$0}END{print last}')
+    last_block=$(printf '%s' "$last_block" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [[ -n $last_block ]]; then
+      printf '%s' "$last_block"
+      return
+    fi
+  fi
+
+  printf '%s' "$cleaned"
+}
+
+choose_model() {
+  mapfile -t models < <(ollama list 2>/dev/null | awk 'NR>1 {print $1}')
+  if [[ ${#models[@]} -eq 0 ]]; then
+    printf 'No Ollama models found. Pull one (e.g. `ollama run llama3.2-vision`).\n' >&2
+    exit 1
+  fi
+
+  printf 'Select an Ollama model:\n'
+  select m in "${models[@]}"; do
+    if [[ -n ${m:-} ]]; then
+      printf 'Using model: %s\n' "$m"
+      MODEL=$m
+      return
+    fi
+    printf 'Invalid choice. Try again.\n'
+  done
+}
+
+process_image() {
+  local img=$1
+  local last_size=-1
+  local current_size
+  local answer
+  local err_file
+  local err_msg
+
+  # Wait until the file stops growing to avoid reading a half-written screenshot.
+  for _ in {1..20}; do
+    current_size=$(stat -c%s "$img" 2>/dev/null || echo -1)
+    [[ $current_size -ge 0 && $current_size -eq $last_size ]] && break
+    last_size=$current_size
+    sleep 0.1
+  done
+
+  err_file=$(mktemp)
+  if ! answer=$(ollama run "$MODEL" --image "$img" "$PROMPT" 2>"$err_file"); then
+    err_msg=$(cat "$err_file")
+    # Fallback for Ollama builds without the --image flag (positional image arg).
+    if printf '%s' "$err_msg" | grep -qi 'unknown flag: --image'; then
+      if ! answer=$(ollama run "$MODEL" "$img" "$PROMPT" 2>"$err_file"); then
+        err_msg=$(cat "$err_file")
+        printf 'ollama failed for %s: %s\n' "$img" "$err_msg" >&2
+        rm -f -- "$img" "$err_file"
+        return
+      fi
+    else
+      printf 'ollama failed for %s: %s\n' "$img" "$err_msg" >&2
+      rm -f -- "$img" "$err_file"
+      return
+    fi
+  fi
+  rm -f -- "$err_file"
+
+  answer=$(strip_thinking "$answer")
+  answer=$(printf '%s' "$answer" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  [[ -z $answer ]] && answer="(no response)"
+
+  printf '%s\n' "$answer"
+  notify_user "$answer"
+  rm -f -- "$img"
+}
+
+main() {
+  require_cmd ollama
+  mkdir -p "$WATCH_DIR"
+  find "$WATCH_DIR" -mindepth 1 -maxdepth 1 -type f -print -delete >/dev/null 2>&1 || true
+
+  choose_model
+
+  printf 'Watching %s for new screenshots. Press Ctrl+C to exit.\n' "$WATCH_DIR"
+  notify_user "Watching $WATCH_DIR with $MODEL"
+
+  while true; do
+    while IFS= read -r -d '' img; do
+      process_image "$img"
+    done < <(find "$WATCH_DIR" -maxdepth 1 -type f -print0)
+    sleep 1
+  done
+}
+
+main "$@"
