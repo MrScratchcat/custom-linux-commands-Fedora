@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+# claude-api installer (Fedora + Ubuntu/Debian).
+#
+# Usage:
+#   ./install-claude-api.sh              interactive, defaults to LAN exposed
+#   ./install-claude-api.sh --localhost  bind 127.0.0.1 only, no auth
+#   ./install-claude-api.sh --port N     custom port (default 8081)
+#   ./install-claude-api.sh -y           non-interactive (uses LAN default)
+#   ./install-claude-api.sh --uninstall  stop service, remove files, close port
+set -euo pipefail
+
+# ---- args ----
+LAN=1
+NONINTERACTIVE=0
+UNINSTALL=0
+PORT=8081
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --localhost|--no-lan) LAN=0; shift ;;
+        --lan) LAN=1; shift ;;
+        --port) PORT="$2"; shift 2 ;;
+        --uninstall|--remove) UNINSTALL=1; shift ;;
+        -y|--yes) NONINTERACTIVE=1; shift ;;
+        -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+        *) echo "unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+[[ $EUID -eq 0 ]] && { echo "run as your normal user, not root" >&2; exit 1; }
+
+INSTALL_DIR="$HOME/.local/share/claude-api"
+UNIT_DIR="$HOME/.config/systemd/user"
+
+# ---- detect OS ----
+. /etc/os-release 2>/dev/null || true
+case "${ID:-}_${ID_LIKE:-}" in
+    *fedora*|*rhel*|*centos*) OS=fedora ;;
+    *ubuntu*|*debian*)         OS=debian ;;
+    *) OS=unknown ;;
+esac
+echo ">> ${PRETTY_NAME:-unknown system} (family: $OS)"
+
+# ---- uninstall path ----
+if [[ $UNINSTALL -eq 1 ]]; then
+    if [[ $NONINTERACTIVE -eq 0 ]]; then
+        read -rp "remove claude-api service and files? [y/N] " ans
+        [[ "${ans,,}" =~ ^y(es)?$ ]] || { echo "aborted"; exit 0; }
+    fi
+
+    echo ">> stopping and disabling service"
+    systemctl --user disable --now claude-api.service 2>/dev/null || true
+
+    echo ">> removing files"
+    rm -rf "$INSTALL_DIR"
+    rm -rf "$UNIT_DIR/claude-api.service" "$UNIT_DIR/claude-api.service.d"
+
+    systemctl --user daemon-reload
+    systemctl --user reset-failed claude-api.service 2>/dev/null || true
+
+    echo ">> closing firewall port $PORT (if open)"
+    if command -v firewall-cmd >/dev/null && sudo systemctl is-active --quiet firewalld; then
+        sudo firewall-cmd --permanent --remove-port="${PORT}/tcp" >/dev/null 2>&1 || true
+        sudo firewall-cmd --reload >/dev/null 2>&1 || true
+    elif command -v ufw >/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+        sudo ufw delete allow "$PORT/tcp" >/dev/null 2>&1 || true
+    fi
+
+    echo
+    echo "claude-api uninstalled. (linger and trusted zones left alone — adjust manually if needed)"
+    exit 0
+fi
+
+# ---- ask about LAN ----
+if [[ $NONINTERACTIVE -eq 0 ]]; then
+    read -rp "expose on LAN (other devices on your network)? [Y/n] " ans
+    [[ "${ans,,}" =~ ^n(o)?$ ]] && LAN=0 || LAN=1
+fi
+
+if [[ $LAN -eq 1 ]]; then
+    BIND=0.0.0.0
+    API_KEY="$(openssl rand -hex 24 2>/dev/null || head -c 32 /dev/urandom | xxd -p | tr -d '\n')"
+    echo ">> LAN mode (bind $BIND, auth required)"
+else
+    BIND=127.0.0.1
+    API_KEY=""
+    echo ">> localhost mode (no auth)"
+fi
+
+# ---- install os packages ----
+install_pkg() {
+    case "$OS" in
+        fedora) sudo dnf install -y "$@" ;;
+        debian) sudo apt-get update -qq && sudo apt-get install -y "$@" ;;
+        *) echo "!! please install manually: $*" >&2; return 1 ;;
+    esac
+}
+
+pkgs=()
+command -v python3 >/dev/null || pkgs+=(python3)
+command -v openssl >/dev/null || pkgs+=(openssl)
+command -v curl    >/dev/null || pkgs+=(curl)
+if ! command -v ip >/dev/null; then
+    [[ $OS == debian ]] && pkgs+=(iproute2) || pkgs+=(iproute)
+fi
+python3 -c "import venv" 2>/dev/null || { [[ $OS == debian ]] && pkgs+=(python3-venv); }
+python3 -c "import ensurepip" 2>/dev/null || { [[ $OS == debian ]] && pkgs+=(python3-pip); }
+
+if [[ ${#pkgs[@]} -gt 0 ]]; then
+    echo ">> installing system packages: ${pkgs[*]}"
+    install_pkg "${pkgs[@]}"
+fi
+
+# ---- check claude cli ----
+if ! command -v claude >/dev/null; then
+    cat >&2 <<EOF
+!! claude CLI not found. Install it first:
+     npm install -g @anthropic-ai/claude-code
+     claude         # log in interactively, then /exit
+   (you'll likely need node 18+; consider nvm if your distro ships an old node)
+EOF
+    exit 1
+fi
+[[ -d "$HOME/.claude" ]] || echo "!! warning: no ~/.claude dir — run \`claude\` once to log in"
+
+# ---- write python server ----
+mkdir -p "$INSTALL_DIR"
+echo ">> writing server to $INSTALL_DIR"
+cat > "$INSTALL_DIR/claude_api_server.py" << 'PYTHON_EOF'
+#!/usr/bin/env python3
+"""OpenAI-compatible API server backed by the `claude` CLI."""
+from __future__ import annotations
+import asyncio, json, logging, os, time, uuid
+from typing import AsyncIterator, Optional
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+HOST = os.environ.get("CLAUDE_API_HOST", "127.0.0.1")
+PORT = int(os.environ.get("CLAUDE_API_PORT", "8081"))
+API_KEY = os.environ.get("CLAUDE_API_KEY", "")
+DEFAULT_MODEL = os.environ.get("CLAUDE_DEFAULT_MODEL", "sonnet")
+DEFAULT_EFFORT = os.environ.get("CLAUDE_DEFAULT_EFFORT", "")  # "", low, medium, high, xhigh, max
+REQUEST_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
+# bypassPermissions lets MCP tools auto-run without approval prompts.
+# Use "default" if you'd rather have everything denied unless explicitly allowed.
+PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions")
+DISALLOWED_TOOLS = os.environ.get(
+    "CLAUDE_DISALLOWED_TOOLS",
+    # Block local-machine tools by default. MCP tools (mcp__*) stay allowed.
+    "Bash,Write,Edit,MultiEdit,NotebookEdit,Read,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite,NotebookRead",
+).split(",")
+
+VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+# OpenAI uses minimal/low/medium/high — map to claude's scale
+EFFORT_ALIASES = {"minimal": "low", "none": "", "off": ""}
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("claude-api")
+app = FastAPI(title="Claude CLI -> OpenAI API")
+
+
+class Message(BaseModel):
+    role: str
+    content: str | list
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str = Field(default=DEFAULT_MODEL)
+    messages: list[Message]
+    stream: bool = False
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    reasoning_effort: Optional[str] = None  # OpenAI compat: low/medium/high
+    # Allow extra fields without erroring (OpenWebUI sends a bunch).
+    class Config:
+        extra = "ignore"
+
+
+MODELS = [
+    {"id": m, "object": "model", "created": 0, "owned_by": "anthropic"}
+    for m in ("claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5")
+]
+
+
+def resolve_model_and_effort(raw: str, request_effort: Optional[str]) -> tuple[str, str]:
+    """Returns (model_id, effort_level). Effort '' means don't set anything."""
+    if ":" in raw:
+        model, _, suffix = raw.partition(":")
+        suffix_effort = suffix.strip().lower()
+    else:
+        model, suffix_effort = raw, ""
+    # priority: request body > model name suffix > server default
+    effort = (request_effort or "").strip().lower() or suffix_effort or DEFAULT_EFFORT
+    effort = EFFORT_ALIASES.get(effort, effort)
+    if effort and effort not in VALID_EFFORTS:
+        log.warning("ignoring unknown effort level: %r", effort)
+        effort = ""
+    return model, effort
+
+
+def check_auth(request: Request) -> None:
+    if not API_KEY:
+        return
+    token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    if token != API_KEY:
+        raise HTTPException(status_code=401, detail="invalid api key")
+
+
+def _stringify(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            (item.get("text", "") if isinstance(item, dict) else str(item))
+            for item in content
+        )
+    return str(content)
+
+
+def messages_to_prompt(messages: list[Message]) -> tuple[str, str]:
+    system_parts, convo_parts = [], []
+    for m in messages:
+        text = _stringify(m.content)
+        if m.role == "system":
+            system_parts.append(text)
+        elif m.role == "user":
+            convo_parts.append(f"Human: {text}")
+        elif m.role == "assistant":
+            convo_parts.append(f"Assistant: {text}")
+    convo_parts.append("Assistant:")
+    return "\n\n".join(system_parts), "\n\n".join(convo_parts)
+
+
+async def run_claude(prompt: str, model: str, system: str, effort: str = "") -> AsyncIterator[dict]:
+    cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose", "--model", model]
+    if PERMISSION_MODE:
+        cmd.extend(["--permission-mode", PERMISSION_MODE])
+    if system:
+        cmd.extend(["--append-system-prompt", system])
+    tools = ",".join(t.strip() for t in DISALLOWED_TOOLS if t.strip())
+    if tools:
+        cmd.extend(["--disallowedTools", tools])
+    env = os.environ.copy()
+    if effort:
+        env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
+    log.info("spawn: %s  (effort=%s)", " ".join(cmd), effort or "default")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    assert proc.stdin and proc.stdout and proc.stderr
+    proc.stdin.write(prompt.encode())
+    await proc.stdin.drain()
+    proc.stdin.close()
+    try:
+        while True:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=REQUEST_TIMEOUT)
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            try:
+                yield json.loads(text)
+            except json.JSONDecodeError:
+                log.warning("non-json line: %r", text[:200])
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise HTTPException(status_code=504, detail="claude timed out")
+    finally:
+        rc = await proc.wait()
+        if rc != 0:
+            err = (await proc.stderr.read()).decode("utf-8", errors="replace")
+            log.error("claude exited %d: %s", rc, err[:500])
+
+
+def extract_text(event: dict) -> str:
+    out = []
+    for block in (event.get("message", {}).get("content") or []):
+        if isinstance(block, dict) and block.get("type") == "text":
+            out.append(block.get("text", ""))
+    return "".join(out)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/v1/models")
+async def list_models(request: Request):
+    check_auth(request)
+    return {"object": "list", "data": MODELS}
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatCompletionRequest, request: Request):
+    check_auth(request)
+    system, prompt = messages_to_prompt(req.messages)
+    model, effort = resolve_model_and_effort(req.model, req.reasoning_effort)
+    cid = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+
+    if req.stream:
+        async def stream() -> AsyncIterator[str]:
+            yield "data: " + json.dumps({
+                "id": cid, "object": "chat.completion.chunk",
+                "created": created, "model": req.model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            }) + "\n\n"
+            emitted = ""
+            try:
+                async for event in run_claude(prompt, model, system, effort):
+                    if event.get("type") != "assistant":
+                        continue
+                    full = extract_text(event)
+                    if not full:
+                        continue
+                    delta = full[len(emitted):] if full.startswith(emitted) else full
+                    if not delta:
+                        continue
+                    emitted += delta
+                    yield "data: " + json.dumps({
+                        "id": cid, "object": "chat.completion.chunk",
+                        "created": created, "model": req.model,
+                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                    }) + "\n\n"
+            except Exception as e:
+                log.exception("stream error")
+                yield "data: " + json.dumps({"error": {"message": str(e), "type": "internal_error"}}) + "\n\n"
+            yield "data: " + json.dumps({
+                "id": cid, "object": "chat.completion.chunk",
+                "created": created, "model": req.model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }) + "\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    emitted = ""
+    async for event in run_claude(prompt, model, system, effort):
+        if event.get("type") != "assistant":
+            continue
+        full = extract_text(event)
+        if not full:
+            continue
+        emitted = full if full.startswith(emitted) else emitted + full
+    return {
+        "id": cid, "object": "chat.completion", "created": created, "model": req.model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": emitted},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+PYTHON_EOF
+
+# ---- venv ----
+echo ">> creating venv"
+python3 -m venv "$INSTALL_DIR/venv"
+"$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
+"$INSTALL_DIR/venv/bin/pip" install --quiet fastapi 'uvicorn[standard]' pydantic
+
+# ---- systemd unit ----
+mkdir -p "$UNIT_DIR"
+echo ">> writing unit to $UNIT_DIR/claude-api.service"
+cat > "$UNIT_DIR/claude-api.service" << EOF
+[Unit]
+Description=Claude CLI -> OpenAI-compatible API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/claude-api/venv/bin/python %h/.local/share/claude-api/claude_api_server.py
+Restart=on-failure
+RestartSec=5
+
+Environment="CLAUDE_API_HOST=$BIND"
+Environment="CLAUDE_API_PORT=$PORT"
+Environment="CLAUDE_DEFAULT_MODEL=sonnet"
+Environment="CLAUDE_DEFAULT_EFFORT="
+Environment="CLAUDE_API_KEY=$API_KEY"
+Environment="PATH=%h/.local/bin:%h/.npm-global/bin:%h/.nvm/versions/node/lts/bin:/usr/local/bin:/usr/bin:/bin"
+
+[Install]
+WantedBy=default.target
+EOF
+
+# wipe any old override drop-in from a previous install attempt
+rm -rf "$UNIT_DIR/claude-api.service.d" 2>/dev/null || true
+
+# ---- firewall ----
+if [[ $LAN -eq 1 ]]; then
+    echo ">> configuring firewall for port $PORT"
+    if command -v firewall-cmd >/dev/null && sudo systemctl is-active --quiet firewalld; then
+        sudo firewall-cmd --permanent --add-port="${PORT}/tcp" >/dev/null
+        sudo firewall-cmd --reload >/dev/null
+        echo "   firewalld: opened $PORT/tcp"
+    elif command -v ufw >/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+        sudo ufw allow "$PORT/tcp" comment "claude-api" >/dev/null
+        echo "   ufw: allowed $PORT/tcp"
+    else
+        echo "   no active firewall detected — nothing to open"
+    fi
+fi
+
+# ---- linger so service starts at boot ----
+if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
+    sudo loginctl enable-linger "$USER" 2>/dev/null \
+        || echo "!! could not enable linger; service won't start at boot until you log in"
+fi
+
+# ---- start service ----
+systemctl --user daemon-reload
+systemctl --user enable claude-api.service >/dev/null 2>&1
+systemctl --user restart claude-api.service
+
+sleep 2
+echo
+echo "== status =="
+if systemctl --user is-active --quiet claude-api.service; then
+    echo "running ✓"
+else
+    echo "!! failed to start. tail of log:"
+    journalctl --user -u claude-api -n 20 --no-pager || true
+    exit 1
+fi
+
+# ---- print connection info ----
+echo
+echo "============================================================"
+echo " Local URL:   http://127.0.0.1:$PORT/v1"
+if [[ $LAN -eq 1 ]]; then
+    lan_ip="$(ip -4 addr show 2>/dev/null \
+        | awk '/inet / && $2 !~ /^127\./ {sub("/.*","",$2); print $2; exit}')"
+    echo " LAN URL:     http://${lan_ip:-YOUR_IP}:$PORT/v1"
+    echo " API key:     $API_KEY"
+fi
+echo "============================================================"
+echo
+echo " logs:    journalctl --user -u claude-api -f"
+echo " edit:    systemctl --user edit claude-api"
+echo " stop:    systemctl --user stop claude-api"
+echo " remove:  systemctl --user disable --now claude-api && \\"
+echo "          rm -rf $INSTALL_DIR $UNIT_DIR/claude-api.service*"
