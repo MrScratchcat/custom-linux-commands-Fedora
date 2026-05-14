@@ -50,6 +50,12 @@ if [[ $UNINSTALL -eq 1 ]]; then
     echo ">> stopping and disabling service"
     systemctl --user disable --now claude-api.service 2>/dev/null || true
 
+    echo ">> killing any leftover processes"
+    pkill -f claude_api_server.py 2>/dev/null || true
+    # give them a moment to exit, then SIGKILL anything stubborn
+    sleep 1
+    pkill -9 -f claude_api_server.py 2>/dev/null || true
+
     echo ">> removing files"
     rm -rf "$INSTALL_DIR"
     rm -rf "$UNIT_DIR/claude-api.service" "$UNIT_DIR/claude-api.service.d"
@@ -63,6 +69,15 @@ if [[ $UNINSTALL -eq 1 ]]; then
         sudo firewall-cmd --reload >/dev/null 2>&1 || true
     elif command -v ufw >/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
         sudo ufw delete allow "$PORT/tcp" >/dev/null 2>&1 || true
+    fi
+
+    echo ">> verifying port $PORT is free"
+    if ss -tlnH "sport = :$PORT" 2>/dev/null | grep -q .; then
+        echo "!! something is still listening on $PORT:"
+        ss -tlnp "sport = :$PORT" 2>/dev/null || true
+        echo "   investigate manually (might be a different service)"
+    else
+        echo "   port $PORT is free ✓"
     fi
 
     echo
@@ -142,6 +157,24 @@ HOST = os.environ.get("CLAUDE_API_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CLAUDE_API_PORT", "8081"))
 API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 DEFAULT_MODEL = os.environ.get("CLAUDE_DEFAULT_MODEL", "sonnet")
+# Comma-separated list of model IDs to expose in /v1/models.
+# Any model string the CLI accepts will work even if not listed here —
+# this just controls what shows in OpenWebUI / OpenCode dropdowns.
+_DEFAULT_MODEL_LIST = ",".join([
+    # current generation
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+    # previous generation
+    "claude-opus-4-5",
+    "claude-sonnet-4-5",
+    "claude-haiku-4",
+    # older 3.x line — may or may not be available on your plan
+    "claude-3-7-sonnet-latest",
+    "claude-3-5-sonnet-latest",
+    "claude-3-5-haiku-latest",
+])
+EXPOSED_MODELS = [m.strip() for m in os.environ.get("CLAUDE_MODELS", _DEFAULT_MODEL_LIST).split(",") if m.strip()]
 DEFAULT_EFFORT = os.environ.get("CLAUDE_DEFAULT_EFFORT", "")  # "", low, medium, high, xhigh, max
 REQUEST_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
 # bypassPermissions lets MCP tools auto-run without approval prompts.
@@ -156,6 +189,15 @@ DISALLOWED_TOOLS = os.environ.get(
 VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 # OpenAI uses minimal/low/medium/high — map to claude's scale
 EFFORT_ALIASES = {"minimal": "low", "none": "", "off": ""}
+# Claude Code triggers extended thinking via magic keywords in the prompt.
+# Token budget grows with each level.
+THINKING_KEYWORDS = {
+    "low":    "think",
+    "medium": "think hard",
+    "high":   "think harder",
+    "xhigh":  "ultrathink",
+    "max":    "ultrathink",
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("claude-api")
@@ -181,7 +223,7 @@ class ChatCompletionRequest(BaseModel):
 
 MODELS = [
     {"id": m, "object": "model", "created": 0, "owned_by": "anthropic"}
-    for m in ("claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5")
+    for m in EXPOSED_MODELS
 ]
 
 
@@ -235,6 +277,16 @@ def messages_to_prompt(messages: list[Message]) -> tuple[str, str]:
 
 
 async def run_claude(prompt: str, model: str, system: str, effort: str = "") -> AsyncIterator[dict]:
+    # Inject the magic keyword to trigger extended thinking.
+    keyword = THINKING_KEYWORDS.get(effort, "")
+    if keyword:
+        marker = "\n\nAssistant:"
+        instruction = f"\n\nPlease {keyword} before answering."
+        if prompt.endswith(marker):
+            prompt = prompt[:-len(marker)] + instruction + marker
+        else:
+            prompt = prompt + instruction
+
     cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose", "--model", model]
     if PERMISSION_MODE:
         cmd.extend(["--permission-mode", PERMISSION_MODE])
@@ -243,16 +295,12 @@ async def run_claude(prompt: str, model: str, system: str, effort: str = "") -> 
     tools = ",".join(t.strip() for t in DISALLOWED_TOOLS if t.strip())
     if tools:
         cmd.extend(["--disallowedTools", tools])
-    env = os.environ.copy()
-    if effort:
-        env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
-    log.info("spawn: %s  (effort=%s)", " ".join(cmd), effort or "default")
+    log.info("spawn: %s  (effort=%s, keyword=%s)", " ".join(cmd), effort or "default", keyword or "none")
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=env,
     )
     assert proc.stdin and proc.stdout and proc.stderr
     proc.stdin.write(prompt.encode())
@@ -280,12 +328,27 @@ async def run_claude(prompt: str, model: str, system: str, effort: str = "") -> 
             log.error("claude exited %d: %s", rc, err[:500])
 
 
-def extract_text(event: dict) -> str:
-    out = []
+def extract_blocks(event: dict) -> tuple[str, str]:
+    """Return (thinking, text) accumulated from this assistant event."""
+    thinking_parts, text_parts = [], []
     for block in (event.get("message", {}).get("content") or []):
-        if isinstance(block, dict) and block.get("type") == "text":
-            out.append(block.get("text", ""))
-    return "".join(out)
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "thinking":
+            thinking_parts.append(block.get("thinking", ""))
+        elif btype == "text":
+            text_parts.append(block.get("text", ""))
+    return "".join(thinking_parts), "".join(text_parts)
+
+
+def compose_output(thinking: str, text: str) -> str:
+    """Wrap thinking in <think> tags so OpenWebUI renders a reasoning section."""
+    if thinking and text:
+        return f"<think>\n{thinking}\n</think>\n\n{text}"
+    if thinking:
+        return f"<think>\n{thinking}"
+    return text
 
 
 @app.get("/health")
@@ -319,13 +382,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 async for event in run_claude(prompt, model, system, effort):
                     if event.get("type") != "assistant":
                         continue
-                    full = extract_text(event)
+                    thinking, text = extract_blocks(event)
+                    full = compose_output(thinking, text)
                     if not full:
                         continue
                     delta = full[len(emitted):] if full.startswith(emitted) else full
                     if not delta:
                         continue
-                    emitted += delta
+                    emitted = full
                     yield "data: " + json.dumps({
                         "id": cid, "object": "chat.completion.chunk",
                         "created": created, "model": req.model,
@@ -342,19 +406,19 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             yield "data: [DONE]\n\n"
         return StreamingResponse(stream(), media_type="text/event-stream")
 
-    emitted = ""
+    final = ""
     async for event in run_claude(prompt, model, system, effort):
         if event.get("type") != "assistant":
             continue
-        full = extract_text(event)
-        if not full:
-            continue
-        emitted = full if full.startswith(emitted) else emitted + full
+        thinking, text = extract_blocks(event)
+        candidate = compose_output(thinking, text)
+        if candidate:
+            final = candidate
     return {
         "id": cid, "object": "chat.completion", "created": created, "model": req.model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": emitted},
+            "message": {"role": "assistant", "content": final},
             "finish_reason": "stop",
         }],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
